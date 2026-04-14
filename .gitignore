@@ -1,0 +1,52 @@
+# Python gitignore template
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Testing
+.coverage
+htmlcov/
+
+BiMPADR-main/
+output_20251203/
+output_20251207/
+forTest/
+
+# Data files
+测试输出结果.csv
+LINCS_Gene_Experssion_signatures_CD.csv
+ctd_gene_adr_asso_list_4386.csv
+
+# Output directories
+**/output_*/
+
+# Temporary data files
+*.npz
+BiMPADR-main/
+*.csv
+*.pdf
+__pycache__/
+2drug-2side/
+logs/
+.idea/
