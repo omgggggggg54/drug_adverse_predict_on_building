@@ -16,13 +16,10 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.data
-from torch.autograd import Variable
 
 from sklearn import metrics
 from sklearn.metrics import mean_squared_error, mean_absolute_error
@@ -32,7 +29,6 @@ from tqdm import tqdm
 from model.model import DGAPred
 from utils.data_utils import data_feature, jaccard_similarity, Convert_triplelist2matrix
 # ChemProp 依赖已移除
-from utils.heterogeneous_graph import HeterogeneousGraphBuilder
 
 # 设置随机种子确保可复现性
 SEED = 42
@@ -42,6 +38,23 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
+
+
+def configure_cpu_threads(torch_threads, torch_interop_threads):
+    """限制 PyTorch 的 CPU 线程池，避免训练时少数核心长时间满载。"""
+    if torch_threads > 0:
+        # intra-op 线程负责单个算子内部的 CPU 并行；CUDA 训练也会用它做调度和部分 CPU 计算。
+        torch.set_num_threads(torch_threads)
+        os.environ["OMP_NUM_THREADS"] = str(torch_threads)
+        os.environ["MKL_NUM_THREADS"] = str(torch_threads)
+
+    if torch_interop_threads > 0:
+        # inter-op 线程负责多个算子之间的并行调度；设小一点可以减少 CPU 抢占。
+        torch.set_num_interop_threads(torch_interop_threads)
+
+    print(f"[CPU] torch_threads={torch.get_num_threads()}, "
+          f"torch_interop_threads={torch.get_num_interop_threads()}")
+
 
 # 设置系统路径
 cur_path = os.path.abspath(os.path.dirname(__file__))
@@ -298,17 +311,6 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     data_train = np.array(data_train)
     data_test = np.array(data_test)
     
-    # Build heterogeneous graph if enabled
-    graph_builder = None
-    if args.use_heterogeneous_gnn:
-        print("\n构建异质图...")
-        graph_builder = HeterogeneousGraphBuilder(
-            rawpath=args.rawpath,
-            drug_list=remain_drug_list,
-            adr_list=adr_list
-        )
-        print(f"异质图构建完成: 总节点数 {graph_builder.get_total_nodes()}")
-        
     train_indices = (
         data_train[:, 0].astype(int),  # drug_indices
         data_train[:, 1].astype(int),  # side_indices
@@ -362,18 +364,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
         n_drug_chunks=n_drug_chunks,
         n_side_chunks=n_side_chunks,
         use_feature_interaction=args.use_feature_interaction,
-        use_contrastive_learning=args.use_contrastive_learning,
-        use_heterogeneous_gnn=args.use_heterogeneous_gnn,
-        graph_builder=graph_builder,
-        han_layers=args.han_layers,
-        han_heads=args.han_heads,
-        k_hop=args.subgraph_k_hop,
-        max_subgraph_nodes=args.subgraph_max_nodes,
-        edge_embed_dim=32,  # 固定边embedding维度
-        max_gene_neighbors=50,  # 固定最大邻居数
-        use_adaptive_sampling=args.use_adaptive_sampling,  # 自适应邻居采样
-        use_multi_scale=args.use_multi_scale_attention,#多尺度注意力机制
-        device=device
+        use_contrastive_learning=args.use_contrastive_learning
     ).to(device)
     
     '''构建损失函数和优化器'''
@@ -402,7 +393,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     '''训练'''
     for epoch in range(1, args.epochs + 1):
         iter_loss_sum, step = train(model, _train_loader, optimizer, Classification_criterion, Regression_criterion, device, 
-                                    global_drug_features_tensor, global_side_features_tensor, epoch, args, graph_builder) # 一个iterater
+                                    global_drug_features_tensor, global_side_features_tensor, epoch, args) # 一个iterater
         train_epoch = iter_loss_sum/step
         train_epoches.append(train_epoch)
         
@@ -417,8 +408,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
                                                                                                            global_side_features_tensor,
                                                                                                            lossfunction1=Classification_criterion,
                                                                                                            lossfunction2=Regression_criterion,
-                                                                                                           epoch=epoch,
-                                                                                                           graph_builder=graph_builder)
+                                                                                                           epoch=epoch)
                                                                                         
         test_epoch = test_iter_loss/test_step
         test_epoches.append(test_epoch)
@@ -446,20 +436,19 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
         if endure_count >15 :
             break
     
-    '''Load best model state for final testing'''
+    '''加载验证阶段表现最好的模型，再做最终测试'''
     
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print(f"\n[Info] Loaded best model from validation (AUC: {AUC_mn:.5f}, AUPR: {AUPR_mn:.5f})")
-    
-    i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(model, _test, device, global_drug_features_tensor, global_side_features_tensor,
-                                                                                                           lossfunction1=Classification_criterion,
-                                                                                                           lossfunction2=Regression_criterion,
-                                                                                                           epoch=epoch,  # 使用最后的 epoch 值
-                                                                                                           graph_builder=graph_builder)
-                                                                                                           
-
-    time_cost = time.time() - start
+    final_start = time.time()
+    i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(
+        model, _test, device, global_drug_features_tensor, global_side_features_tensor,
+        lossfunction1=Classification_criterion,
+        lossfunction2=Regression_criterion,
+        epoch=epoch
+    )
+    time_cost = time.time() - final_start
     print("Time: %.2f <Test> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
         time_cost, rmse, mae, i_auc, iPR_auc, acc, mcc))
     print('The best AUC/AUPR: %.5f / %.5f' % (i_auc, iPR_auc))
@@ -498,7 +487,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     return i_auc, iPR_auc, rmse, mae, acc, mcc
 
 def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device, 
-          global_drug_features, global_side_features, epoch, args=None, graph_builder=None):
+          global_drug_features, global_side_features, epoch, args=None):
     """训练函数 - 带进度条和实时指标"""
     model.train()
     
@@ -534,7 +523,7 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
         one_label_index = np.nonzero(labels.data.numpy())
         
         # 标签平滑
-        if args is not None and hasattr(args, 'label_smooth') and args.label_smooth > 0:
+        if args.label_smooth > 0:
             eps = float(args.label_smooth)
             y_target = (1.0 - eps) * labels + 0.5 * eps
         else:
@@ -548,11 +537,10 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
         
         # Add contrastive loss if available
         if contrastive_loss is not None:
-            lambda_contrastive = args.contrastive_weight if hasattr(args, 'contrastive_weight') else 0.1
-            total_loss = total_loss + lambda_contrastive * contrastive_loss
+            total_loss = total_loss + args.contrastive_weight * contrastive_loss
         
         total_loss.backward()
-        if args is not None and hasattr(args, 'grad_clip') and args.grad_clip is not None and args.grad_clip > 0:
+        if args.grad_clip is not None and args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
         optimizer.step()
         
@@ -567,7 +555,7 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
 
     return avg_loss, step
 
-def test(model, test_loader, device, global_drug_features, global_side_features, lossfunction1, lossfunction2, epoch=0, graph_builder=None):
+def test(model, test_loader, device, global_drug_features, global_side_features, lossfunction1, lossfunction2, epoch=0):
     """测试函数 - 带进度条和实时指标"""
     model.eval()
     
@@ -658,21 +646,21 @@ if __name__ == '__main__':
                         metavar = 'N', help = 'embedding dimension')
     parser.add_argument('--weight_decay', type = float, default = 1e-5,
                         metavar = 'FLOAT', help = 'weight decay')
-    parser.add_argument('--N', type = int, default = 15000,
-                        metavar = 'N', help = 'L0 parameter')
-    parser.add_argument('--droprate', type = float, default = 0.5,
-                        metavar = 'FLOAT', help = 'dropout rate 训练无关')
     parser.add_argument('--batch_size', type = int, default = 128,
                         metavar = 'N', help = 'input batch size for training')
     parser.add_argument('--test_batch_size', type = int, default =128,
                         metavar = 'N', help = 'input batch size for testing')
+    parser.add_argument('--torch_threads', type=int, default=0,
+                        metavar='N', help='PyTorch CPU算子线程数，0表示使用环境默认值')
+    parser.add_argument('--torch_interop_threads', type=int, default=0,
+                        metavar='N', help='PyTorch CPU算子调度线程数，0表示使用环境默认值')
     parser.add_argument('--rawpath', type=str, default='pythonPredict/DGAPred(Compare)/2drug-2side/DGAPred/data/',
                         metavar='STRING', help='rawpath')
 
     parser.add_argument('--similarity_path', type=str, default='pythonPredict/',
                         metavar='STRING', help='similarity matrices path')
     # 训练稳健性与正则化
-    parser.add_argument('--dropout1', type=float, default=0.4,metavar='FLOAT', help='HAN encoder dropout rate')
+    parser.add_argument('--dropout1', type=float, default=0.4,metavar='FLOAT', help='主特征编码阶段的dropout')
     parser.add_argument('--dropout2', type=float, default=0.2,metavar='FLOAT', help='Final prediction dropout rate')
     parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数(0~0.2)，仅训练使用')
     parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，<=0 关闭')
@@ -683,15 +671,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_contrastive_learning', action='store_true', help='启用协同对比学习 (CCL-ASPS 2024)',default=True)
     parser.add_argument('--contrastive_weight', type=float, default=0.20, metavar='FLOAT', help='对比学习损失权重')
 
-    # 异质图神经网络 (HAN)
-    parser.add_argument('--use_heterogeneous_gnn', action='store_true', help='启用异质图神经网络 (HAN)', default=True)
-    parser.add_argument('--han_layers', type=int, default=3, metavar='N', help='HAN层数（控制传播深度）')
-    parser.add_argument('--han_heads', type=int, default=8, metavar='N', help='HAN注意力头数')
-    parser.add_argument('--subgraph_k_hop', type=int, default=2, metavar='N', help='子图采样K-hop跳数')
-    parser.add_argument('--subgraph_max_nodes', type=int, default=350,metavar='N', help='子图最大节点数')
-    parser.add_argument('--use_adaptive_sampling', action='store_true', help='启用自适应邻居采样', default=True)
-    parser.add_argument('--use_multi_scale_attention', action='store_true', help='启用Multi-Scale Attention', default=True)
     args = parser.parse_args()
+    configure_cpu_threads(args.torch_threads, args.torch_interop_threads)
     druglist = pd.read_csv(args.rawpath+"lincs_druglist_ge_go_521.csv")
     
     remain_drug_list,adr_list, drug_side = load_label(druglist["pert_id"],True,True, args)#drug_sided的行索引remain_drug_list,列索引adr_list

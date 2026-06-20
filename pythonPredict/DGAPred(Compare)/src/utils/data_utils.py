@@ -3,8 +3,6 @@ import pandas as pd # 用于处理数据的工具
 import numpy as np
 from utils.clac_dis_mesh_sim import cal_SimilarityByMeSHDAG
 from alive_progress import alive_bar # 显示循环的进度条工具
-from scipy.spatial.distance import squareform
-from scipy.spatial.distance import pdist, jaccard
 from sklearn.metrics import jaccard_score
 
 

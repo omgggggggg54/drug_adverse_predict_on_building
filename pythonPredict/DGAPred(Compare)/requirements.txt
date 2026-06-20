@@ -1,0 +1,12 @@
+# 普通科学计算包走 PyPI，PyTorch CUDA 13.0 wheel 走官方额外源。
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# 项目训练与评估主依赖
+torch==2.12.1+cu130
+numpy>=1.26,<3
+pandas>=2.2,<4
+scikit-learn>=1.5,<2
+tqdm>=4.66,<5
+alive-progress>=3.1,<4
+requests>=2.31,<3

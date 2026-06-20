@@ -43,6 +43,8 @@ ctd_gene_adr_asso_list_4386.csv
 
 # Temporary data files
 *.npz
+*.zip
+*.md
 BiMPADR-main/
 *.csv
 *.pdf
@@ -50,3 +52,5 @@ __pycache__/
 2drug-2side/
 logs/
 .idea/
+aligned_mapping/
+Plug-play-modules-main/
