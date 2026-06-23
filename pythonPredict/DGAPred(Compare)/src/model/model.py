@@ -17,14 +17,40 @@ class ContrastiveLearningModule(nn.Module):
     Implements contrastive learning between individual views and fused features
     to enhance representation quality.
     """
-    def __init__(self, feature_dim: int, temperature: float = 0.07):
+    def __init__(self, feature_dim: int, temperature: float = 0.07,
+                 loss_type: str = "standard", tau_plus: float = 0.1):
         super(ContrastiveLearningModule, self).__init__()
         self.temperature = temperature
+        self.loss_type = loss_type
+        self.tau_plus = tau_plus
         self.projection_head = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.ReLU(),
             nn.Linear(feature_dim, feature_dim // 2)
         )
+
+    def _standard_infonce(self, similarity: torch.Tensor) -> torch.Tensor:
+        batch_size = similarity.size(0)
+        labels = torch.arange(batch_size, device=similarity.device)
+        return F.cross_entropy(similarity, labels)
+
+    def _debiased_infonce(self, similarity: torch.Tensor) -> torch.Tensor:
+        batch_size = similarity.size(0)
+        if batch_size <= 1:
+            return similarity.new_tensor(0.0)
+
+        exp_sim = torch.exp(similarity)
+        pos_sim = exp_sim.diag()
+        neg_mask = ~torch.eye(batch_size, dtype=torch.bool, device=similarity.device)
+        neg_sum = exp_sim.masked_select(neg_mask).view(batch_size, batch_size - 1).sum(dim=1)
+        neg_count = batch_size - 1
+
+        # DCL估计并扣除负样本池中的假阴性污染。
+        debiased_neg = (neg_sum - self.tau_plus * neg_count * pos_sim) / (1.0 - self.tau_plus)
+        neg_floor = neg_count * torch.exp(torch.tensor(-1.0 / self.temperature, device=similarity.device))
+        debiased_neg = torch.clamp(debiased_neg, min=neg_floor)
+        loss = -torch.log(pos_sim / (pos_sim + debiased_neg + 1e-12))
+        return loss.mean()
     
     def forward(self, features_list: list, fused_features: torch.Tensor) -> torch.Tensor:
         """Compute collaborative contrastive loss.
@@ -44,15 +70,13 @@ class ContrastiveLearningModule(nn.Module):
             view_proj = self.projection_head(view_features)
             view_proj = F.normalize(view_proj, dim=-1)
             
-            # Compute similarity matrix
+            # 计算当前视图与融合表示之间的相似度矩阵，对角线是正样本对。
             similarity = torch.matmul(view_proj, fused_proj.T) / self.temperature
             
-            # Positive pairs are on the diagonal
-            batch_size = similarity.size(0)
-            labels = torch.arange(batch_size, device=similarity.device)
-            
-            # InfoNCE loss
-            loss = F.cross_entropy(similarity, labels)
+            if self.loss_type == "debiased":
+                loss = self._debiased_infonce(similarity)
+            else:
+                loss = self._standard_infonce(similarity)
             total_loss += loss
         
         return total_loss / len(features_list)
@@ -174,7 +198,9 @@ class DGAPred(nn.Module):
                  batchsize: int=128, dropout1: float = 0.5, dropout2: float = 0.5,
                  n_drug_chunks: int = 2, n_side_chunks: int = 2,
                  use_feature_interaction: bool = True,
-                 use_contrastive_learning: bool = True):
+                 use_contrastive_learning: bool = True,
+                 contrastive_loss_type: str = "standard",
+                 d4_tau_plus: float = 0.1):
         """Initialize DGAPred model.
         
         Args:
@@ -188,10 +214,12 @@ class DGAPred(nn.Module):
             n_side_chunks: Number of chunks for side effect features
             use_feature_interaction: Whether to use feature interaction attention
             use_contrastive_learning: Whether to use contrastive learning
+            contrastive_loss_type: 对比损失类型，standard或debiased
+            d4_tau_plus: DCL假阴性比例先验
         """
         super(DGAPred, self).__init__()
         
-        # Basic dimensions
+        # 基础维度配置
         self.drugs_dim = drugs_dim
         self.sides_dim = sides_dim
         self.embed_dim = embed_dim
@@ -199,18 +227,18 @@ class DGAPred(nn.Module):
         self.dropout1 = dropout1
         self.dropout2 = dropout2
         
-        # Feature chunking configuration
+        # 多源特征分块配置
         self.drug_chunks = n_drug_chunks
         self.side_chunks = n_side_chunks
         self.drug_dim = drugs_dim // self.drug_chunks
         self.side_dim = sides_dim // self.side_chunks
         
-        # Advanced technique flags
+        # 高级模块开关
         self.use_feature_interaction = use_feature_interaction
         self.use_contrastive_learning = use_contrastive_learning
         
         # ----------------------------------------------------------------
-        # Global feature encoding layers
+        # 全局特征编码层
         # ----------------------------------------------------------------
         self.drugs_layer = nn.Linear(drugs_dim, embed_dim)
         self.drugs_layer_1 = nn.Linear(embed_dim, embed_dim)
@@ -220,15 +248,15 @@ class DGAPred(nn.Module):
         self.sides_layer_1 = nn.Linear(embed_dim, embed_dim)
         self.sides_bn = nn.BatchNorm1d(embed_dim, momentum=0.5)
         
-        # Projection back to original dimensions for chunking
+        # 投影回原始维度后再切块，保持当前 D1 主逻辑不变。
         self.drug_back_proj = nn.Linear(embed_dim, drugs_dim)
         self.side_embed_dim = embed_dim  # side embedding 要走图的drug->side传播涉及concat特殊处理
         
         # ----------------------------------------------------------------
-        # Chunk-specific feature encoding layers
+        # 分块特征编码层
         # ----------------------------------------------------------------
 
-        # Drug chunk encoders
+        # 药物分块编码器
         self.drug_layer1 = nn.Linear(self.drug_dim, embed_dim)
         self.drug_layer1_1 = nn.Linear(embed_dim, embed_dim)
         self.drug_layer2 = nn.Linear(self.drug_dim, embed_dim)
@@ -240,7 +268,7 @@ class DGAPred(nn.Module):
         self.drug2_bn = nn.BatchNorm1d(embed_dim, momentum=0.5)
         self.drug3_4_bn = nn.BatchNorm1d(embed_dim, momentum=0.5)
         
-        # Side effect chunk encoders
+        # 副作用分块编码器
         self.side_layer1 = nn.Linear(self.side_dim, embed_dim)
         self.side_layer1_1 = nn.Linear(embed_dim, embed_dim)
         self.side_layer2 = nn.Linear(self.side_dim, embed_dim)
@@ -253,7 +281,7 @@ class DGAPred(nn.Module):
         self.side3_bn = nn.BatchNorm1d(embed_dim, momentum=0.5)
         
         # ----------------------------------------------------------------
-        # Interaction map processing
+        # 交互图处理模块
         # ----------------------------------------------------------------
 
         self.channel_size = 32
@@ -282,11 +310,11 @@ class DGAPred(nn.Module):
         # 自适应池化：将 [batch, 32, 64, 64] -> [batch, 32, 2, 2]
         self.adaptive_pool = nn.AdaptiveAvgPool2d((2, 2))
         
-        # Finalize side projection layer
+        # 副作用回投影层
         self.side_back_proj = nn.Linear(self.side_embed_dim, self.sides_dim)
         
         # ----------------------------------------------------------------
-        # Advanced modules
+        # 高级模块
         # ----------------------------------------------------------------
         
         # Feature Interaction Attention (FIA-DTA 2025)
@@ -302,13 +330,15 @@ class DGAPred(nn.Module):
             fused_feature_dim = self.channel_size * 4 + embed_dim + self.side_embed_dim
             self.contrastive_module = ContrastiveLearningModule(
                 feature_dim=fused_feature_dim,
-                temperature=0.07
+                temperature=0.07,
+                loss_type=contrastive_loss_type,
+                tau_plus=d4_tau_plus
             )
         
         # ChemProp 编码器已移除
             
         # ----------------------------------------------------------------
-        # Final prediction layers
+        # 最终预测层
         # ----------------------------------------------------------------
         
         total_input_dim = self.channel_size * 4 + embed_dim + self.side_embed_dim
@@ -466,19 +496,19 @@ class DGAPred(nn.Module):
         total = torch.cat((x_drugs_embed, h, x_sides_embed), dim=1)
         contrastive_loss = None  # 初始化变量
         if self.use_contrastive_learning and self.training:
-            # Create noisy view for contrastive learning
+            # 构造带轻微噪声的增强视图，用于和融合表示做对比学习。
             noise = torch.randn_like(total)
             total_noise = total + torch.sign(total) * F.normalize(noise, dim=-1) * 0.1
             total_views = [total_noise]
             
-            # Compute contrastive loss
+            # 根据开关选择标准 InfoNCE 或 D4 去偏 InfoNCE。
             contrastive_loss = self.contrastive_module(
                 features_list=total_views,
                 fused_features=total
             )
         
         # ----------------------------------------------------------------
-        # Step 10: Final prediction
+        # Step 10: 最终预测
         # ----------------------------------------------------------------
         total = F.relu(self.total_layer(total), inplace=True)
         total = F.dropout(total, training=self.training, p=self.dropout2)

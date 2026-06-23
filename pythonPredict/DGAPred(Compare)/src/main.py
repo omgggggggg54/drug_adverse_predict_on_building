@@ -56,6 +56,77 @@ def configure_cpu_threads(torch_threads, torch_interop_threads):
           f"torch_interop_threads={torch.get_num_interop_threads()}")
 
 
+def get_d4_contrastive_weight(epoch, args):
+    """D4对比损失权重热身，降低训练早期假阴性梯度冲击。"""
+    if not args.use_d4_contrastive_warmup:
+        return args.contrastive_weight
+    warmup_epochs = max(1, int(args.d4_warmup_epochs))
+    return args.contrastive_weight * min(1.0, epoch / warmup_epochs)
+
+
+def build_d4_drug_similarity(drug_features):
+    """融合药物多源相似性矩阵，作为负样本假阴性风险的结构依据。"""
+    normalized_sims = []
+    for sim in drug_features:
+        sim = np.nan_to_num(np.asarray(sim, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        sim_min, sim_max = float(sim.min()), float(sim.max())
+        if sim_min < 0.0 or sim_max > 1.0:
+            sim = (sim - sim_min) / (sim_max - sim_min + 1e-12)
+        normalized_sims.append(np.clip(sim, 0.0, 1.0))
+    return np.mean(normalized_sims, axis=0)
+
+
+def compute_d4_negative_risks(negative_samples, DAL, drug_sim):
+    """计算每个未报告负样本靠近同ADR阳性药物的程度，值越大越像假阴性。"""
+    negative_samples = np.asarray(negative_samples)
+    side_ids = negative_samples[:, 1].astype(int)
+    drug_ids = negative_samples[:, 0].astype(int)
+    risks = np.zeros(len(negative_samples), dtype=np.float32)
+
+    for side_idx in np.unique(side_ids):
+        positive_drugs = np.flatnonzero(DAL[:, side_idx] > 0)
+        if len(positive_drugs) == 0:
+            continue
+        sample_idx = np.flatnonzero(side_ids == side_idx)
+        risks[sample_idx] = drug_sim[drug_ids[sample_idx]][:, positive_drugs].max(axis=1)
+
+    return np.clip(np.nan_to_num(risks, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+
+def d4_similarity_aware_negative_resampling(addition_negative_sample, final_positive_sample,
+                                            final_negative_sample, DAL, drug_features, args):
+    """复用剩余负样本池，对高假阴性风险负样本降权后重新抽取1:1负样本。"""
+    if not args.use_d4_similarity_negative_weighting:
+        return final_negative_sample
+
+    candidate_negative = np.vstack((final_negative_sample, addition_negative_sample))
+    drug_sim = build_d4_drug_similarity(drug_features)
+    risks = compute_d4_negative_risks(candidate_negative, DAL, drug_sim)
+    cutoff = np.percentile(risks, args.d4_negative_risk_percentile)
+
+    # 高于分位阈值的负样本更可能是假阴性，降权但不直接删除，避免过度筛数据。
+    weights = np.where(risks > cutoff, 1.0 - risks, 1.0)
+    weights = np.clip(weights, args.d4_negative_min_weight, 1.0)
+    probs = weights / weights.sum()
+
+    sample_size = len(final_positive_sample)
+    sampled_idx = np.random.choice(len(candidate_negative), size=sample_size, replace=False, p=probs)
+    sampled_negative = candidate_negative[sampled_idx]
+    sampled_risks = risks[sampled_idx]
+
+    args.d4_negative_candidate_count = int(len(candidate_negative))
+    args.d4_negative_sampled_count = int(len(sampled_negative))
+    args.d4_negative_risk_cutoff = float(cutoff)
+    args.d4_negative_risk_mean_before = float(risks.mean())
+    args.d4_negative_risk_mean_after = float(sampled_risks.mean())
+
+    print("[D4] similarity-aware negative weighting enabled")
+    print(f"[D4] negative candidates: {len(candidate_negative)}, sampled negatives: {len(sampled_negative)}")
+    print(f"[D4] risk percentile cutoff: {cutoff:.4f}, min_weight: {args.d4_negative_min_weight:.4f}")
+    print(f"[D4] risk mean before/after: {risks.mean():.4f} / {sampled_risks.mean():.4f}")
+    return sampled_negative
+
+
 # 设置系统路径
 cur_path = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, cur_path + "/..")
@@ -354,6 +425,14 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     '''构建模型'''
     n_drug_chunks = len(drug_feature)
     n_side_chunks = len(side_feature)
+    d4_method = args.contrastive_loss_type
+    if args.use_d4_contrastive_warmup:
+        d4_method += "+warmup"
+    if args.use_d4_contrastive_scale_norm:
+        d4_method += "+scale_norm"
+    if args.use_d4_similarity_negative_weighting:
+        d4_method += "+similarity_negative_weighting"
+    print(f"D4 contrastive method: {d4_method}")
     model = DGAPred(
         drugs_dim=drug_feature[0].shape[0]*n_drug_chunks,
         sides_dim=side_feature[0].shape[0]*n_side_chunks,
@@ -364,7 +443,9 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
         n_drug_chunks=n_drug_chunks,
         n_side_chunks=n_side_chunks,
         use_feature_interaction=args.use_feature_interaction,
-        use_contrastive_learning=args.use_contrastive_learning
+        use_contrastive_learning=args.use_contrastive_learning,
+        contrastive_loss_type=args.contrastive_loss_type,
+        d4_tau_plus=args.d4_tau_plus
     ).to(device)
     
     '''构建损失函数和优化器'''
@@ -461,6 +542,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
             f.write("\n===== Hyperparameters =====\n")
             for arg, value in vars(args).items():
                 f.write(f"{arg}: {value}\n")
+            f.write(f"D4 contrastive method: {d4_method}\n")
             f.write("===========================\n\n")
         f.write("Fold %d: AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f\n" % (fold, i_auc, iPR_auc, acc, mcc))
     with open(os.path.join(output_dir, f'model_fold{str(fold)}.pkl'), 'wb') as f:
@@ -535,9 +617,14 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
         lambda_cls = 0.7  # 分类任务权重
         total_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
         
-        # Add contrastive loss if available
+        # D4：对比损失可选去偏、权重热身和尺度归一化，不改变评估逻辑。
         if contrastive_loss is not None:
-            total_loss = total_loss + args.contrastive_weight * contrastive_loss
+            contrastive_weight = get_d4_contrastive_weight(epoch, args)
+            if args.use_d4_contrastive_scale_norm:
+                scale_ref = loss1.detach().clamp(min=1e-3)
+                cl_scale = contrastive_loss.detach().clamp(min=1e-3)
+                contrastive_loss = contrastive_loss * (scale_ref / cl_scale)
+            total_loss = total_loss + contrastive_weight * contrastive_loss
         
         total_loss.backward()
         if args.grad_clip is not None and args.grad_clip > 0:
@@ -670,6 +757,22 @@ if __name__ == '__main__':
     parser.add_argument('--use_feature_interaction', action='store_true', help='启用特征交互注意力 (FIA-DTA 2025)',default=True)
     parser.add_argument('--use_contrastive_learning', action='store_true', help='启用协同对比学习 (CCL-ASPS 2024)',default=True)
     parser.add_argument('--contrastive_weight', type=float, default=0.20, metavar='FLOAT', help='对比学习损失权重')
+    parser.add_argument('--contrastive_loss_type', type=str, default='standard',
+                        choices=['standard', 'debiased'], help='D4对比损失类型')
+    parser.add_argument('--d4_tau_plus', type=float, default=0.10,
+                        metavar='FLOAT', help='D4去偏InfoNCE假阴性比例先验')
+    parser.add_argument('--use_d4_contrastive_warmup', action='store_true',
+                        help='启用D4对比损失权重热身')
+    parser.add_argument('--d4_warmup_epochs', type=int, default=15,
+                        metavar='N', help='D4对比损失权重热身轮数')
+    parser.add_argument('--use_d4_contrastive_scale_norm', action='store_true',
+                        help='启用D4对比损失尺度归一化')
+    parser.add_argument('--use_d4_similarity_negative_weighting', action='store_true',
+                        help='启用D4相似性风险负样本降权重采样')
+    parser.add_argument('--d4_negative_risk_percentile', type=float, default=90.0,
+                        metavar='FLOAT', help='D4高假阴性风险负样本分位阈值')
+    parser.add_argument('--d4_negative_min_weight', type=float, default=0.05,
+                        metavar='FLOAT', help='D4高风险负样本最低保留权重')
 
     args = parser.parse_args()
     configure_cpu_threads(args.torch_threads, args.torch_interop_threads)
@@ -677,9 +780,21 @@ if __name__ == '__main__':
     
     remain_drug_list,adr_list, drug_side = load_label(druglist["pert_id"],True,True, args)#drug_sided的行索引remain_drug_list,列索引adr_list
     print("drug_side shape:",pd.DataFrame(drug_side).shape)
+
+    # 加载药物和不良反应特征；D4负样本风险评分需要先拿到药物相似性矩阵。
+    drug_feature = load_drug_feature(remain_drug_list, args)
+    side_feature = load_adr_feature(adr_list, args)
     
     #不参与训练的负样本，len(final_positive_sample)=len(final_negative_sample)
     addition_negative_sample, final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values, addition_negative_number='all')#分离正负样本并均衡正负样本
+    final_negative_sample = d4_similarity_aware_negative_resampling(
+        addition_negative_sample,
+        final_positive_sample,
+        final_negative_sample,
+        drug_side.values,
+        drug_feature,
+        args
+    )
     final_sample = np.vstack((final_positive_sample, final_negative_sample))
     X = final_sample[:, 0::]
     final_target = final_sample[:, final_sample.shape[1] - 1]
@@ -692,10 +807,7 @@ if __name__ == '__main__':
         data_y.append((int(float(X[i, 2]))))
         data.append((X[i, 0], X[i, 1], X[i, 2]))
     
-    #加载药物和不良反应特征
-    drug_feature=load_drug_feature(remain_drug_list, args)
-    side_feature=load_adr_feature(adr_list, args)
-    # Normal training
+    # 正常五折训练
     fold = 1
     kfold = StratifiedKFold(5, random_state=5, shuffle=True)
     total_auc, total_pr_auc, total_rmse, total_mae = [], [], [], []
