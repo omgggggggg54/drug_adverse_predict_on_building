@@ -40,8 +40,17 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 
-def configure_cpu_threads(torch_threads, torch_interop_threads):
-    """限制 PyTorch 的 CPU 线程池，避免训练时少数核心长时间满载。"""
+def configure_cpu_threads(torch_threads, torch_interop_threads, prefer_cuda=False):
+    """限制 PyTorch 的 CPU 线程池，避免 CUDA 训练时 CPU 线程池长期忙等。"""
+    if prefer_cuda and torch_threads <= 0:
+        torch_threads = min(4, max(1, os.cpu_count() or 1))
+    if prefer_cuda and torch_interop_threads <= 0:
+        torch_interop_threads = 1
+
+    # OpenMP 在线程空闲时默认会忙等，这会让几个核心看起来一直满载。
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+
     if torch_threads > 0:
         # intra-op 线程负责单个算子内部的 CPU 并行；CUDA 训练也会用它做调度和部分 CPU 计算。
         torch.set_num_threads(torch_threads)
@@ -54,14 +63,6 @@ def configure_cpu_threads(torch_threads, torch_interop_threads):
 
     print(f"[CPU] torch_threads={torch.get_num_threads()}, "
           f"torch_interop_threads={torch.get_num_interop_threads()}")
-
-
-def get_d4_contrastive_weight(epoch, args):
-    """D4对比损失权重热身，降低训练早期假阴性梯度冲击。"""
-    if not args.use_d4_contrastive_warmup:
-        return args.contrastive_weight
-    warmup_epochs = max(1, int(args.d4_warmup_epochs))
-    return args.contrastive_weight * min(1.0, epoch / warmup_epochs)
 
 
 def build_d4_drug_similarity(drug_features):
@@ -262,7 +263,20 @@ def load_adr_feature(screen_adr_list, args):
     print(f"  - GDA:  {adr_GDisease_sim.shape}")
     print(f"{'='*60}\n")
     
-    return side_features    
+    return side_features
+
+
+def split_val_test(data_test, val_ratio=0.2, seed=42):
+    """从当前测试折里切出验证集和最终测试集。
+
+    只对测试折做二次划分，训练折不变。
+    """
+    data_test = np.array(data_test)
+    labels = data_test[:, 2].astype(int)
+    n_splits = max(2, int(round(1.0 / val_ratio)))
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    val_idx, test_idx = next(splitter.split(np.zeros(len(labels)), labels))
+    return data_test[val_idx].tolist(), data_test[test_idx].tolist()
 
 # ============================================================================
 # Data Preprocessing Functions
@@ -344,7 +358,7 @@ def sparse_multilabel_categorical_crossentropy(y_true=None, y_pred=None, mask_ze
 # Training and Evaluation Functions
 # ============================================================================
 
-def train_test(drug_feature, side_feature, data_train, data_test, fold, args, remain_drug_list, adr_list, output_dir):
+def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold, args, remain_drug_list, adr_list, output_dir):
     """一折的训练和评估函数。
     
     Args:
@@ -380,6 +394,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     
     # 直接处理训练测试数据，无需额外函数
     data_train = np.array(data_train)
+    data_val = np.array(data_val)
     data_test = np.array(data_test)
     
     train_indices = (
@@ -388,29 +403,34 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
         data_train[:, 2]               # labels
     )
     
+    val_indices = (
+        data_val[:, 0].astype(int),
+        data_val[:, 1].astype(int),
+        data_val[:, 2]
+    )
+
     test_indices = (
         data_test[:, 0].astype(int),
         data_test[:, 1].astype(int),
         data_test[:, 2]
     )
     
-    '''构建训练集和测试集'''
+    '''构建训练集、验证集和最终测试集'''
     trainset = torch.utils.data.TensorDataset(
         torch.LongTensor(train_indices[0]),  # drug_indices
         torch.LongTensor(train_indices[1]),  # side_indices
         torch.FloatTensor(train_indices[2])  # labels
+    )
+    valset = torch.utils.data.TensorDataset(
+        torch.LongTensor(val_indices[0]),
+        torch.LongTensor(val_indices[1]),
+        torch.FloatTensor(val_indices[2])
     )
     testset = torch.utils.data.TensorDataset(
         torch.LongTensor(test_indices[0]),
         torch.LongTensor(test_indices[1]),
         torch.FloatTensor(test_indices[2])
     )
-    
-    _test = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=True,
-                                        num_workers=0, pin_memory=True)
-
-    _train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True,
-                                                num_workers=0, pin_memory=True)
     
     '''配置cuda加速'''
     torch.backends.cudnn.benchmark = True
@@ -419,20 +439,49 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     if torch.cuda.is_available():
         use_cuda = True
     device = torch.device("cuda" if use_cuda else "cpu")
+    if use_cuda:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+    # 全局特征矩阵很小，直接每个 fold 只搬一次到 GPU，避免每个 batch 重复整表拷贝。
+    global_drug_features_tensor = global_drug_features_tensor.to(device, non_blocking=use_cuda)
+    global_side_features_tensor = global_side_features_tensor.to(device, non_blocking=use_cuda)
+
+    # 当前数据集已经在内存里，额外 worker 反而会放大 CPU 调度和拷贝开销。
+    _val = torch.utils.data.DataLoader(
+        valset,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=use_cuda
+    )
+
+    _test = torch.utils.data.DataLoader(
+        testset,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=use_cuda
+    )
+    print(f"[Fold {fold}] samples: train={len(trainset)}, val={len(valset)}, test={len(testset)}")
+
+    _train_loader = torch.utils.data.DataLoader(
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_cuda
+    )
 
     # ChemProp 编码器已移除
     
     '''构建模型'''
     n_drug_chunks = len(drug_feature)
     n_side_chunks = len(side_feature)
-    d4_method = args.contrastive_loss_type
-    if args.use_d4_contrastive_warmup:
-        d4_method += "+warmup"
-    if args.use_d4_contrastive_scale_norm:
-        d4_method += "+scale_norm"
     if args.use_d4_similarity_negative_weighting:
-        d4_method += "+similarity_negative_weighting"
-    print(f"D4 contrastive method: {d4_method}")
+        print("[D4] similarity-aware negative weighting enabled for this run")
     model = DGAPred(
         drugs_dim=drug_feature[0].shape[0]*n_drug_chunks,
         sides_dim=side_feature[0].shape[0]*n_side_chunks,
@@ -441,22 +490,25 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
         dropout1=args.dropout1,
         dropout2=args.dropout2,
         n_drug_chunks=n_drug_chunks,
-        n_side_chunks=n_side_chunks,
-        use_feature_interaction=args.use_feature_interaction,
-        use_contrastive_learning=args.use_contrastive_learning,
-        contrastive_loss_type=args.contrastive_loss_type,
-        d4_tau_plus=args.d4_tau_plus
+        n_side_chunks=n_side_chunks
     ).to(device)
     
     '''构建损失函数和优化器'''
     Regression_criterion = nn.MSELoss()
     Classification_criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # 服务器环境里 foreach/multi_tensor Adam 偶发会在 step 阶段长时间卡住。
+    # 这里关闭 foreach，换成更稳的逐参数更新实现，避免训练进程假死。
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        foreach=False
+    )
     
     '''构建学习率调度器'''
     scheduler = None
     if args.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)#模型的性能在一段时间内没有提升时，就自动把学习率降低
     
     '''初始化训练指数变量'''
     AUC_mn = 0
@@ -473,34 +525,38 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     
     '''训练'''
     for epoch in range(1, args.epochs + 1):
-        iter_loss_sum, step = train(model, _train_loader, optimizer, Classification_criterion, Regression_criterion, device, 
-                                    global_drug_features_tensor, global_side_features_tensor, epoch, args) # 一个iterater
+        iter_loss_sum, step = train(
+            model,
+            _train_loader,
+            optimizer,
+            Classification_criterion,
+            Regression_criterion,
+            device,
+            global_drug_features_tensor,
+            global_side_features_tensor,
+            args=args
+        )  # 一个iterater
         train_epoch = iter_loss_sum/step
         train_epoches.append(train_epoch)
         
-        # 清理CUDA缓存，防止显存碎片累积
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        t_i_auc, t_iPR_auc, t_rmse, t_mae, t_acc, t_mcc, t_ground_i, t_ground_u, t_ground_truth, t_pred1, t_pred2, test_iter_loss, test_step = test(model,
-                                                                                                           _test,
+        v_i_auc, v_iPR_auc, v_rmse, v_mae, v_acc, v_mcc, v_ground_i, v_ground_u, v_ground_truth, v_pred1, v_pred2, val_iter_loss, val_step = test(model,
+                                                                                                           _val,
                                                                                                            device,
                                                                                                            global_drug_features_tensor,
                                                                                                            global_side_features_tensor,
                                                                                                            lossfunction1=Classification_criterion,
-                                                                                                           lossfunction2=Regression_criterion,
-                                                                                                           epoch=epoch)
-                                                                                        
-        test_epoch = test_iter_loss/test_step
+                                                                                                           lossfunction2=Regression_criterion)
+                                                                                         
+        test_epoch = val_iter_loss/val_step
         test_epoches.append(test_epoch)
 
 
         is_better = (t_i_auc > AUC_mn) or (t_iPR_auc > AUPR_mn)
         if is_better:
-            AUC_mn = max(AUC_mn, t_i_auc)
-            AUPR_mn = max(AUPR_mn, t_iPR_auc)
-            rms_mn = min(rms_mn, t_rmse)
-            mae_mn = min(mae_mn, t_mae)
+            AUC_mn = max(AUC_mn, v_i_auc)
+            AUPR_mn = max(AUPR_mn, v_iPR_auc)
+            rms_mn = min(rms_mn, v_rmse)
+            mae_mn = min(mae_mn, v_mae)
             endure_count = 0
             # Save best model state
             best_model_state = deepcopy(model.state_dict())
@@ -508,10 +564,10 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
             endure_count += 1
 
         if scheduler is not None:
-            scheduler.step(t_i_auc)
+            scheduler.step(v_i_auc)
 
-        print("Epoch: %d <Test after train-epoch> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
-        epoch, t_rmse, t_mae, t_i_auc, t_iPR_auc, t_acc, t_mcc))
+        print("Epoch: %d <Val after train-epoch> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
+        epoch, v_rmse, v_mae, v_i_auc, v_iPR_auc, v_acc, v_mcc))
         start = time.time()
 
         if endure_count >15 :
@@ -526,8 +582,7 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
     i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(
         model, _test, device, global_drug_features_tensor, global_side_features_tensor,
         lossfunction1=Classification_criterion,
-        lossfunction2=Regression_criterion,
-        epoch=epoch
+        lossfunction2=Regression_criterion
     )
     time_cost = time.time() - final_start
     print("Time: %.2f <Test> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
@@ -542,7 +597,6 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
             f.write("\n===== Hyperparameters =====\n")
             for arg, value in vars(args).items():
                 f.write(f"{arg}: {value}\n")
-            f.write(f"D4 contrastive method: {d4_method}\n")
             f.write("===========================\n\n")
         f.write("Fold %d: AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f\n" % (fold, i_auc, iPR_auc, acc, mcc))
     with open(os.path.join(output_dir, f'model_fold{str(fold)}.pkl'), 'wb') as f:
@@ -568,8 +622,8 @@ def train_test(drug_feature, side_feature, data_train, data_test, fold, args, re
 
     return i_auc, iPR_auc, rmse, mae, acc, mcc
 
-def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device, 
-          global_drug_features, global_side_features, epoch, args=None):
+def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
+          global_drug_features, global_side_features, args=None):
     """训练函数 - 带进度条和实时指标"""
     model.train()
     
@@ -579,8 +633,8 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
     # 创建进度条
     pbar = tqdm(enumerate(train_loader, 0), total=len(train_loader), desc="Training")
     for step, (drug_idx, side_idx, ratings) in pbar:
-        
-        # 构建二分类标签
+        # 标签保留 CPU 版本用于 dataloader 输出统计，同时把真正参与训练的张量异步送到 GPU。
+        ratings = ratings.to(device, non_blocking=True)
         labels = (ratings > 0).float()
         
         optimizer.zero_grad()
@@ -591,18 +645,11 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
             side_indices=side_idx,
             device=device,
             global_drug_features=global_drug_features,
-            global_side_features=global_side_features,
-            epoch=epoch  # ARConv 需要 epoch 参数来自适应调整卷积核
+            global_side_features=global_side_features
         )
-        #已写完
-        # Handle contrastive learning output
-        if len(model_output) == 3:
-            logits, reconstruction, contrastive_loss = model_output
-        else:
-            logits, reconstruction = model_output
-            contrastive_loss = None
+        logits, reconstruction = model_output
         
-        one_label_index = np.nonzero(labels.data.numpy())
+        positive_mask = labels > 0
         
         # 标签平滑
         if args.label_smooth > 0:
@@ -612,19 +659,10 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
             y_target = labels
         
         # 计算损失
-        loss1 = lossfunction1(logits, y_target.to(device))
-        loss2 = lossfunction2(reconstruction[one_label_index], ratings[one_label_index].to(device))
+        loss1 = lossfunction1(logits, y_target)
+        loss2 = lossfunction2(reconstruction[positive_mask], ratings[positive_mask])
         lambda_cls = 0.7  # 分类任务权重
         total_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
-        
-        # D4：对比损失可选去偏、权重热身和尺度归一化，不改变评估逻辑。
-        if contrastive_loss is not None:
-            contrastive_weight = get_d4_contrastive_weight(epoch, args)
-            if args.use_d4_contrastive_scale_norm:
-                scale_ref = loss1.detach().clamp(min=1e-3)
-                cl_scale = contrastive_loss.detach().clamp(min=1e-3)
-                contrastive_loss = contrastive_loss * (scale_ref / cl_scale)
-            total_loss = total_loss + contrastive_weight * contrastive_loss
         
         total_loss.backward()
         if args.grad_clip is not None and args.grad_clip > 0:
@@ -642,7 +680,7 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
 
     return avg_loss, step
 
-def test(model, test_loader, device, global_drug_features, global_side_features, lossfunction1, lossfunction2, epoch=0):
+def test(model, test_loader, device, global_drug_features, global_side_features, lossfunction1, lossfunction2):
     """测试函数 - 带进度条和实时指标"""
     model.eval()
     
@@ -656,13 +694,16 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
     
     # 创建进度条，使用no_grad避免构建计算图
     pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc="Testing")
-    with torch.no_grad():
+    with torch.inference_mode():
       for step, (drug_idx, side_idx, ratings) in pbar:
         # 构建二分类标签
-        labels = (ratings > 0).float()
+        ratings_cpu = ratings
+        labels_cpu = (ratings_cpu > 0).float()
+        ratings = ratings_cpu.to(device, non_blocking=True)
+        labels = labels_cpu.to(device, non_blocking=True)
         
-        ground_i.append(list(drug_idx.data.cpu().numpy()))
-        ground_u.append(list(side_idx.data.cpu().numpy()))
+        ground_i.append(drug_idx.tolist())
+        ground_u.append(side_idx.tolist())
         
         # 前向传播score_one:classfication score_two:regression
         scores_one, scores_two = model(
@@ -670,14 +711,13 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
             side_indices=side_idx,
             device=device,
             global_drug_features=global_drug_features,
-            global_side_features=global_side_features,
-            epoch=epoch  # ARConv 需要 epoch 参数
+            global_side_features=global_side_features
         )
-        one_label_index = np.nonzero(labels.data.numpy())
+        positive_mask = labels > 0
         
         # 计算损失
-        loss1 = lossfunction1(scores_one, labels.to(device))#BCEWithLogitsLoss内部会做sigmoid
-        loss2 = lossfunction2(scores_two[one_label_index], ratings[one_label_index].to(device))#在正样本上计算MSELoss
+        loss1 = lossfunction1(scores_one, labels)#BCEWithLogitsLoss内部会做sigmoid
+        loss2 = lossfunction2(scores_two[positive_mask], ratings[positive_mask])#在正样本上计算MSELoss
         lambda_cls = 0.7
         test_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
         test_avg_loss += test_loss.detach().item()
@@ -686,8 +726,8 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
         prob_one = torch.sigmoid(scores_one)
         pred1.append(list(prob_one.data.cpu().numpy()))
         pred2.append(list(scores_two.data.cpu().numpy()))
-        ground_truth.append(list(ratings.data.cpu().numpy()))
-        label_truth.append(list(labels.data.cpu().numpy()))
+        ground_truth.append(ratings_cpu.tolist())
+        label_truth.append(labels_cpu.tolist())
         
         # 更新进度条显示（显示平均loss）
         pbar.set_postfix({'loss': f'{test_avg_loss/(step+1):.4f}'})
@@ -738,9 +778,9 @@ if __name__ == '__main__':
     parser.add_argument('--test_batch_size', type = int, default =128,
                         metavar = 'N', help = 'input batch size for testing')
     parser.add_argument('--torch_threads', type=int, default=0,
-                        metavar='N', help='PyTorch CPU算子线程数，0表示使用环境默认值')
+                        metavar='N', help='PyTorch CPU算子线程数，0表示CUDA训练时自动限制到较低值')
     parser.add_argument('--torch_interop_threads', type=int, default=0,
-                        metavar='N', help='PyTorch CPU算子调度线程数，0表示使用环境默认值')
+                        metavar='N', help='PyTorch CPU算子调度线程数，0表示CUDA训练时自动限制到较低值')
     parser.add_argument('--rawpath', type=str, default='pythonPredict/DGAPred(Compare)/2drug-2side/DGAPred/data/',
                         metavar='STRING', help='rawpath')
 
@@ -749,24 +789,9 @@ if __name__ == '__main__':
     # 训练稳健性与正则化
     parser.add_argument('--dropout1', type=float, default=0.4,metavar='FLOAT', help='主特征编码阶段的dropout')
     parser.add_argument('--dropout2', type=float, default=0.2,metavar='FLOAT', help='Final prediction dropout rate')
-    parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数(0~0.2)，仅训练使用')
-    parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，<=0 关闭')
-    parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=True)
-    # FIA-DTA 2025: 特征交互注意力机制，增强药物与靶标的多模态特征交互
-    # CCL-ASPS 2024: 协同对比学习框架，提升模型表征能力
-    parser.add_argument('--use_feature_interaction', action='store_true', help='启用特征交互注意力 (FIA-DTA 2025)',default=True)
-    parser.add_argument('--use_contrastive_learning', action='store_true', help='启用协同对比学习 (CCL-ASPS 2024)',default=True)
-    parser.add_argument('--contrastive_weight', type=float, default=0.20, metavar='FLOAT', help='对比学习损失权重')
-    parser.add_argument('--contrastive_loss_type', type=str, default='standard',
-                        choices=['standard', 'debiased'], help='D4对比损失类型')
-    parser.add_argument('--d4_tau_plus', type=float, default=0.10,
-                        metavar='FLOAT', help='D4去偏InfoNCE假阴性比例先验')
-    parser.add_argument('--use_d4_contrastive_warmup', action='store_true',
-                        help='启用D4对比损失权重热身')
-    parser.add_argument('--d4_warmup_epochs', type=int, default=15,
-                        metavar='N', help='D4对比损失权重热身轮数')
-    parser.add_argument('--use_d4_contrastive_scale_norm', action='store_true',
-                        help='启用D4对比损失尺度归一化')
+    parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数，默认0表示关闭；开启示例：--label_smooth 0.05')
+    parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，默认0表示关闭；开启示例：--grad_clip 0.5')
+    parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=False)
     parser.add_argument('--use_d4_similarity_negative_weighting', action='store_true',
                         help='启用D4相似性风险负样本降权重采样')
     parser.add_argument('--d4_negative_risk_percentile', type=float, default=90.0,
@@ -775,7 +800,11 @@ if __name__ == '__main__':
                         metavar='FLOAT', help='D4高风险负样本最低保留权重')
 
     args = parser.parse_args()
-    configure_cpu_threads(args.torch_threads, args.torch_interop_threads)
+    configure_cpu_threads(
+        args.torch_threads,
+        args.torch_interop_threads,
+        prefer_cuda=torch.cuda.is_available()
+    )
     druglist = pd.read_csv(args.rawpath+"lincs_druglist_ge_go_521.csv")
     
     remain_drug_list,adr_list, drug_side = load_label(druglist["pert_id"],True,True, args)#drug_sided的行索引remain_drug_list,列索引adr_list

@@ -54,6 +54,7 @@ logs/
 .idea/
 aligned_mapping/
 Plug-play-modules-main/
+scripts/
 !adr*.csv
 !drug*.csv
 !side*.csv

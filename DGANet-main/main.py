@@ -33,6 +33,11 @@ import pickle
 # import sweetviz as sv
 import warnings
 
+# nohup 重定向日志时，Python 默认可能会块缓冲输出。
+# 改成行缓冲后，每次 print 换行都会立即写入日志，方便 tail -f 实时观察进度。
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # 设置随机种子确保可复现性
 SEED = 42
 random.seed(SEED)
@@ -173,11 +178,28 @@ def sparse_multilabel_categorical_crossentropy(y_true=None, y_pred=None, mask_ze
 
 
 def train_test(drug_feature,side_feature,data_train, data_test, data_neg, fold, args, output_dir):
-    drug_test, side_test, f_test, drug_train, side_train, f_train = split_train_test(drug_feature,side_feature,data_train, data_test)
-    trainset = torch.utils.data.TensorDataset(torch.FloatTensor(drug_train), torch.FloatTensor(side_train),
-                                              torch.FloatTensor(f_train))
-    testset = torch.utils.data.TensorDataset(torch.FloatTensor(drug_test), torch.FloatTensor(side_test),
-                                             torch.FloatTensor(f_test))
+    # 每个 fold 只拼一次全局特征矩阵。
+    # DataLoader 只分发药物索引、副作用索引和标签，避免反复复制完整特征。
+    drug_features_matrix = drug_feature[0]
+    for i in range(1, len(drug_feature)):
+        drug_features_matrix = np.hstack((drug_features_matrix, drug_feature[i]))
+
+    side_features_matrix = side_feature[0]
+    for i in range(1, len(side_feature)):
+        side_features_matrix = np.hstack((side_features_matrix, side_feature[i]))
+
+    data_train = np.array(data_train)
+    data_test = np.array(data_test)
+    trainset = torch.utils.data.TensorDataset(
+        torch.LongTensor(data_train[:, 0].astype(int)),
+        torch.LongTensor(data_train[:, 1].astype(int)),
+        torch.FloatTensor(data_train[:, 2])
+    )
+    testset = torch.utils.data.TensorDataset(
+        torch.LongTensor(data_test[:, 0].astype(int)),
+        torch.LongTensor(data_test[:, 1].astype(int)),
+        torch.FloatTensor(data_test[:, 2])
+    )
     use_cuda = torch.cuda.is_available()
     _train = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True,
                                          num_workers=0, pin_memory=use_cuda)
@@ -189,13 +211,25 @@ def train_test(drug_feature,side_feature,data_train, data_test, data_neg, fold, 
     if torch.cuda.is_available():
         use_cuda = True
     device = torch.device("cuda" if use_cuda else "cpu")
+    global_drug_features = torch.FloatTensor(drug_features_matrix).to(device, non_blocking=use_cuda)
+    global_side_features = torch.FloatTensor(side_features_matrix).to(device, non_blocking=use_cuda)
+    if use_cuda:
+        # 服务器常见的 Ampere/Ada GPU 支持 TF32。
+        # 这里对齐 pythonPredict 的加速设置，能提升矩阵乘和卷积速度。
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+    print(f"[Fold {fold}] device: {device}, train samples: {len(trainset)}, test samples: {len(testset)}", flush=True)
+    print(f"[Fold {fold}] train batches: {len(_train)}, test batches: {len(_test)}", flush=True)
+    print(f"[Fold {fold}] global feature tensors: drug {tuple(global_drug_features.shape)}, side {tuple(global_side_features.shape)}", flush=True)
 
     n_drug_chunks = len(drug_feature)  # 动态获取drug特征数量
     n_side_chunks = len(side_feature)  # 动态获取side特征数量
-    model = DGAPred(drug_feature[0].shape[0]*n_drug_chunks, side_feature[0].shape[0]*n_side_chunks, args.embed_dim, args.batch_size, n_drug_chunks=n_drug_chunks, n_side_chunks=n_side_chunks).to(device)
+    model = DGAPred(global_drug_features.shape[1], global_side_features.shape[1], args.embed_dim, args.batch_size, n_drug_chunks=n_drug_chunks, n_side_chunks=n_side_chunks).to(device)
     Classification_criterion = nn.MSELoss()
     Regression_criterion = nn.MSELoss()  # 回归损失函数 (与改进模型一致)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, foreach=False)
 
 
     AUC_mn = 0
@@ -211,17 +245,24 @@ def train_test(drug_feature,side_feature,data_train, data_test, data_neg, fold, 
     test_epoches = []
     for epoch in range(1, args.epochs + 1):
         """epoch开始"""
+        print(f"[Fold {fold}] Epoch {epoch} training start", flush=True)
         # ====================   training    ====================
-        iter_loss_sum, step = train(model, _train, optimizer, Classification_criterion, Regression_criterion, device) # 一个iterater
+        iter_loss_sum, step = train(model, _train, optimizer, Classification_criterion, Regression_criterion, device,
+                                    global_drug_features, global_side_features, fold, epoch) # 一个iterater
         train_epoch = iter_loss_sum/step
         train_epoches.append(train_epoch)
         # ====================     test       ====================
 
+        print(f"[Fold {fold}] Epoch {epoch} testing start", flush=True)
         t_i_auc, t_iPR_auc, t_rmse, t_mae, t_acc, t_mcc, t_ground_i, t_ground_u, t_ground_truth, t_pred1, t_pred2, test_iter_loss, test_step = test(model,
                                                                                                             _test,
                                                                                                             _test,
                                                                                                             device,
-                                                                                                            lossfunction1=Classification_criterion)
+                                                                                                            lossfunction1=Classification_criterion,
+                                                                                                            global_drug_features=global_drug_features,
+                                                                                                            global_side_features=global_side_features,
+                                                                                                            fold=fold,
+                                                                                                            epoch=epoch)
         test_epoch = test_iter_loss/test_step
         test_epoches.append(test_epoch)
 
@@ -251,7 +292,17 @@ def train_test(drug_feature,side_feature,data_train, data_test, data_neg, fold, 
         model.load_state_dict(best_model_state)
         print(f"\n[Info] Loaded best model from validation (AUC: {AUC_mn:.5f}, AUPR: {AUPR_mn:.5f})")
     
-    i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(model, _test, _test, device,lossfunction1=Classification_criterion)
+    i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(
+        model,
+        _test,
+        _test,
+        device,
+        lossfunction1=Classification_criterion,
+        global_drug_features=global_drug_features,
+        global_side_features=global_side_features,
+        fold=fold,
+        epoch=epoch
+    )
 
     time_cost = time.time() - start
     print("Time: %.2f Epoch: %d <Test> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
@@ -286,19 +337,25 @@ def train_test(drug_feature,side_feature,data_train, data_test, data_neg, fold, 
 
     return i_auc, iPR_auc, rmse, mae, acc, mcc
 
-def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device):
+def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
+          global_drug_features, global_side_features, fold=None, epoch=None):
     """训练函数 - 与改进模型一致，同时训练分类和回归损失"""
     model.train()
     avg_loss = 0.0
+    total_steps = len(train_loader)
+    log_interval = max(1, total_steps // 10)
 
     for step, data in enumerate(train_loader, 0):
-        batch_drug, batch_side, batch_ratings = data
+        batch_drug_idx, batch_side_idx, batch_ratings = data
         batch_labels = batch_ratings.clone().float()
         for k in range(batch_ratings.data.size()[0]):
             if batch_ratings.data[k] > 0:
                 batch_labels.data[k] = 1
         optimizer.zero_grad()
 
+        # 全局特征已经在 GPU 上，batch 里只传索引，直接按索引取对应特征。
+        batch_drug = global_drug_features[batch_drug_idx.to(device, non_blocking=True)]
+        batch_side = global_side_features[batch_side_idx.to(device, non_blocking=True)]
         logits, regression = model(batch_drug, batch_side, device)
         
         # 分类损失
@@ -315,13 +372,18 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device):
         lambda_cls = 0.7
         total_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
         
-        total_loss.backward(retain_graph = True)
+        total_loss.backward()
         optimizer.step()
         avg_loss += total_loss.item()
 
-    return avg_loss, step
+        # 每个 epoch 打印约 10 次进度，避免长时间没有日志误判为卡死。
+        if (step + 1) % log_interval == 0 or (step + 1) == total_steps:
+            print(f"[Fold {fold}] Epoch {epoch} train batch {step + 1}/{total_steps}, loss: {total_loss.item():.5f}", flush=True)
 
-def test(model, test_loader, neg_loader, device, lossfunction1):
+    return avg_loss, step + 1
+
+def test(model, test_loader, neg_loader, device, lossfunction1,
+         global_drug_features, global_side_features, fold=None, epoch=None):
     model.eval()
     pred1 = []
     pred2 = []
@@ -330,26 +392,35 @@ def test(model, test_loader, neg_loader, device, lossfunction1):
     ground_u = []
     ground_i = []
     test_avg_loss = 0.0
-    for step, (test_drug, test_side, test_ratings) in enumerate(test_loader):
+    total_steps = len(test_loader)
+    log_interval = max(1, total_steps // 5)
+    with torch.no_grad():
+        for step, (test_drug_idx, test_side_idx, test_ratings) in enumerate(test_loader):
 
-        test_labels = test_ratings.clone().long()
-        for k in range(test_ratings.data.size()[0]):
-            if test_ratings.data[k] > 0:
-                test_labels.data[k] = 1
-        ground_i.append(list(test_drug.data.cpu().numpy()))
-        ground_u.append(list(test_side.data.cpu().numpy()))
-        test_u, test_i, test_ratings = test_drug.to(device), test_side.to(device), test_ratings.to(device)
-        scores_one, scores_two = model(test_drug, test_side, device)
-        """Loss"""
-        one_label_index = np.nonzero(test_labels.data.numpy())
-        loss1 = lossfunction1(scores_one, test_labels.to(device))
-        test_loss = loss1
-        test_avg_loss += test_loss.detach().item()
-        """"""
-        pred1.append(list(scores_one.data.cpu().numpy()))
-        pred2.append(list(scores_two.data.cpu().numpy()))
-        ground_truth.append(list(test_ratings.data.cpu().numpy()))
-        label_truth.append(list(test_labels.data.cpu().numpy()))
+            test_labels = test_ratings.clone().long()
+            for k in range(test_ratings.data.size()[0]):
+                if test_ratings.data[k] > 0:
+                    test_labels.data[k] = 1
+            ground_i.append(list(test_drug_idx.data.cpu().numpy()))
+            ground_u.append(list(test_side_idx.data.cpu().numpy()))
+            test_drug = global_drug_features[test_drug_idx.to(device, non_blocking=True)]
+            test_side = global_side_features[test_side_idx.to(device, non_blocking=True)]
+            test_ratings = test_ratings.to(device)
+            scores_one, scores_two = model(test_drug, test_side, device)
+            """Loss"""
+            one_label_index = np.nonzero(test_labels.data.numpy())
+            loss1 = lossfunction1(scores_one, test_labels.to(device))
+            test_loss = loss1
+            test_avg_loss += test_loss.detach().item()
+            """"""
+            pred1.append(list(scores_one.data.cpu().numpy()))
+            pred2.append(list(scores_two.data.cpu().numpy()))
+            ground_truth.append(list(test_ratings.data.cpu().numpy()))
+            label_truth.append(list(test_labels.data.cpu().numpy()))
+
+            # 测试阶段不反传，日志频率可以低一点。
+            if (step + 1) % log_interval == 0 or (step + 1) == total_steps:
+                print(f"[Fold {fold}] Epoch {epoch} test batch {step + 1}/{total_steps}", flush=True)
 
     pred1 = np.array(sum(pred1, []), dtype = np.float32)
     pred2 = np.array(sum(pred2, []), dtype=np.float32)
@@ -378,10 +449,13 @@ def test(model, test_loader, neg_loader, device, lossfunction1):
     acc = metrics.accuracy_score(label_truth, pred_labels)
     mcc = metrics.matthews_corrcoef(label_truth, pred_labels)
 
-    return i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step
+    return i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step + 1
 
 
 if __name__ == '__main__':
+    print(f"[Start] DGANet training started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[Start] Current working directory: {os.getcwd()}", flush=True)
+
     # Training settings
     parser = argparse.ArgumentParser(description = 'Model')
     parser.add_argument('--epochs', type = int, default = 100,
@@ -407,17 +481,24 @@ if __name__ == '__main__':
     parser.add_argument('--similarity_path', type=str, default='pythonPredict/',
                         metavar='STRING', help='similarity matrices path (与改进模型一致)')
     args = parser.parse_args()
+
+    print(f"[Config] rawpath: {args.rawpath}", flush=True)
+    print(f"[Config] similarity_path: {args.similarity_path}", flush=True)
+
     # 数据准备
+    print("[Data] Loading drug list...", flush=True)
     druglist = pd.read_csv(args.rawpath+"lincs_druglist_ge_go_521.csv") # 筛选实验药物
     
+    print("[Data] Loading label matrix...", flush=True)
     remain_drug_list,adr_list, drug_side = load_label(druglist["pert_id"],True,True, args)
-    print("drug_side shape:",pd.DataFrame(drug_side).shape)
+    print("drug_side shape:",pd.DataFrame(drug_side).shape, flush=True)
     # pd.DataFrame(drug_side).to_csv("drug_side.csv",header=True,index=True)
     # drug_side_report=sv.analyze(drug_side)
     # drug_side_report.show_html(filepath=f"drug_side_report{str(time.strftime('%Y%m%d%H%M'))}.html",open_browser=False)
     # adr_list=pd.DataFrame(adr_list,columns=["MESH_ID"])
 
     #不参与训练的负样本，len(final_positive_sample)=len(final_negative_sample)
+    print("[Data] Extracting positive and negative samples...", flush=True)
     addition_negative_sample, final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values, addition_negative_number='all')
     final_sample = np.vstack((final_positive_sample, final_negative_sample))#均衡抽样
     X = final_sample[:, 0::]
@@ -437,6 +518,8 @@ if __name__ == '__main__':
         data_x.append((X[i, 0], X[i, 1]))
         data_y.append((int(float(X[i, 2]))))
         data.append((X[i, 0], X[i, 1], X[i, 2]))
+    print(f"[Data] Balanced samples: {len(data)}, extra negative samples: {len(data_neg)}", flush=True)
+
     drug_feature=load_drug_feature(remain_drug_list, args)
     side_feature=load_adr_feature(adr_list, args)
 
