@@ -215,18 +215,26 @@ def load_drug_feature(screen_drug_list, args):
     print("加载药物特征")
     print(f"{'='*60}")
     
-    # 加载预先计算的相似性矩阵
-    drug_cs = np.array(pd.read_csv(os.path.join(args.similarity_path, "drug_rdkit.csv"), header=0, index_col=0))
-    drug_DGen = np.array(pd.read_csv(os.path.join(args.similarity_path, "drug_DGen_sim.csv"), header=0, index_col=0))
-    drug_ge_sim = np.array(pd.read_csv(os.path.join(args.similarity_path, "drug_ge_sim.csv"), header=0, index_col=0))
-    
-    # 聚合特征
-    drug_features = [drug_DGen, drug_ge_sim, drug_cs]
-    
+    selected = parse_feature_tokens(args.drug_features)
+    feature_files = [
+        ("DGen", "drug_DGen_sim.csv"),
+        ("GE", "drug_ge_sim.csv"),
+        ("CS", "drug_rdkit.csv"),
+        ("Morgan", "drug_morgan.csv"),
+        ("MACCS", "drug_maccs.csv"),
+    ]
+
+    drug_features = []
     print(f"\n药物特征已加载:")
-    print(f"  - DGen:   {drug_DGen.shape}")
-    print(f"  - GE:     {drug_ge_sim.shape}")
-    print(f"  - CS:     {drug_cs.shape}")
+    for name, filename in feature_files:
+        if name.upper() not in selected:
+            print(f"  - {name}: skipped")
+            continue
+        feature = np.array(pd.read_csv(os.path.join(args.similarity_path, filename), header=0, index_col=0))
+        drug_features.append(feature)
+        print(f"  - {name}: {feature.shape}")
+    if len(drug_features) == 0:
+        raise ValueError("至少需要启用一个 drug feature")
     print(f"{'='*60}\n")
     
     return drug_features
@@ -249,18 +257,23 @@ def load_adr_feature(screen_adr_list, args):
     print("Loading Side Effect Features")
     print(f"{'='*60}")
     
-    # Load precomputed similarity matrices
-    side_mesh_sim = np.array(pd.read_csv(os.path.join(args.similarity_path, "side_mesh_sim.csv"), 
-                                          header=0, index_col=0))
-    adr_GDisease_sim = np.array(pd.read_csv(os.path.join(args.similarity_path, "adr_GDisease_sim.csv"), 
-                                             header=0, index_col=0))
-    
-    # Aggregate features
-    side_features = [side_mesh_sim, adr_GDisease_sim]
-    
+    selected = parse_feature_tokens(args.adr_features)
+    feature_files = [
+        ("MESH", "side_mesh_sim.csv"),
+        ("GDA", "adr_GDisease_sim.csv"),
+    ]
+
+    side_features = []
     print(f"\nSide effect features loaded:")
-    print(f"  - MESH: {side_mesh_sim.shape}")
-    print(f"  - GDA:  {adr_GDisease_sim.shape}")
+    for name, filename in feature_files:
+        if name.upper() not in selected:
+            print(f"  - {name}: skipped")
+            continue
+        feature = np.array(pd.read_csv(os.path.join(args.similarity_path, filename), header=0, index_col=0))
+        side_features.append(feature)
+        print(f"  - {name}: {feature.shape}")
+    if len(side_features) == 0:
+        raise ValueError("至少需要启用一个 ADR feature")
     print(f"{'='*60}\n")
     
     return side_features
@@ -277,6 +290,32 @@ def split_val_test(data_test, val_ratio=0.2, seed=42):
     splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     val_idx, test_idx = next(splitter.split(np.zeros(len(labels)), labels))
     return data_test[val_idx].tolist(), data_test[test_idx].tolist()
+
+
+def parse_feature_tokens(text):
+    """把逗号分隔的特征开关字符串转成大写集合。"""
+    return {item.strip().upper() for item in str(text).split(",") if item.strip()}
+
+
+def add_dsa_features(drug_features, side_features, drug_side, hidden_data, args):
+    """按 DGANet baseline 构造 DSA 特征。
+
+    验证集和最终测试集位置会先置 0，避免 DSA 特征看到待评估标签。
+    """
+    selected_drug = parse_feature_tokens(args.drug_features)
+    selected_side = parse_feature_tokens(args.adr_features)
+    if "DSA" not in selected_drug and "DSA" not in selected_side:
+        return drug_features, side_features
+
+    drug_side_for_sim = drug_side.values.copy()
+    hidden_array = np.array(hidden_data)
+    drug_side_for_sim[hidden_array[:, 0].astype(int), hidden_array[:, 1].astype(int)] = 0
+    drug_side_sim = jaccard_similarity(drug_side_for_sim)
+    side_drug_sim = jaccard_similarity(drug_side_for_sim.T)
+
+    print(f"[DSA] drug-side similarity: {drug_side_sim.shape}")
+    print(f"[DSA] side-drug similarity: {side_drug_sim.shape}")
+    return drug_features + [drug_side_sim], side_features + [side_drug_sim]
 
 # ============================================================================
 # Data Preprocessing Functions
@@ -365,7 +404,8 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
         drug_feature: 药物相似性矩阵列表
         side_feature: 副作用相似性矩阵列表
         data_train: 训练样本
-        data_test: 测试样本
+        data_val: 验证样本
+        data_test: 最终测试样本
         fold: 当前折数
         args: 命令行参数
         remain_drug_list: 药物ID列表
@@ -478,19 +518,19 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
     # ChemProp 编码器已移除
     
     '''构建模型'''
-    n_drug_chunks = len(drug_feature)
-    n_side_chunks = len(side_feature)
+    drug_feature_dims = [feature.shape[1] for feature in drug_feature]
+    side_feature_dims = [feature.shape[1] for feature in side_feature]
     if args.use_d4_similarity_negative_weighting:
         print("[D4] similarity-aware negative weighting enabled for this run")
     model = DGAPred(
-        drugs_dim=drug_feature[0].shape[0]*n_drug_chunks,
-        sides_dim=side_feature[0].shape[0]*n_side_chunks,
+        drugs_dim=sum(drug_feature_dims),
+        sides_dim=sum(side_feature_dims),
         embed_dim=args.embed_dim,
         batchsize=args.batch_size,
         dropout1=args.dropout1,
         dropout2=args.dropout2,
-        n_drug_chunks=n_drug_chunks,
-        n_side_chunks=n_side_chunks
+        drug_feature_dims=drug_feature_dims,
+        side_feature_dims=side_feature_dims
     ).to(device)
     
     '''构建损失函数和优化器'''
@@ -551,7 +591,7 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
         test_epoches.append(test_epoch)
 
 
-        is_better = (t_i_auc > AUC_mn) or (t_iPR_auc > AUPR_mn)
+        is_better = (v_i_auc > AUC_mn) or (v_iPR_auc > AUPR_mn)
         if is_better:
             AUC_mn = max(AUC_mn, v_i_auc)
             AUPR_mn = max(AUPR_mn, v_iPR_auc)
@@ -792,6 +832,10 @@ if __name__ == '__main__':
     parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数，默认0表示关闭；开启示例：--label_smooth 0.05')
     parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，默认0表示关闭；开启示例：--grad_clip 0.5')
     parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=False)
+    parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA',
+                        help='药物特征列表，逗号分隔，例如 DGen,GE,CS,Morgan,MACCS,DSA')
+    parser.add_argument('--adr_features', type=str, default='MESH,GDA,DSA',
+                        help='ADR特征列表，逗号分隔，例如 MESH,GDA,DSA')
     parser.add_argument('--use_d4_similarity_negative_weighting', action='store_true',
                         help='启用D4相似性风险负样本降权重采样')
     parser.add_argument('--d4_negative_risk_percentile', type=float, default=90.0,
@@ -850,7 +894,26 @@ if __name__ == '__main__':
     for k, (train_split, test_split) in enumerate(kfold.split(data_x, data_y)):
         print("==================================fold {} start".format(fold))
         data = np.array(data)
-        auc, PR_auc, rmse, mae, acc, mcc = train_test(drug_feature,side_feature,data[train_split].tolist(), data[test_split].tolist(),fold,args,remain_drug_list,adr_list,output_dir)
+        val_data, test_data = split_val_test(data[test_split].tolist(), val_ratio=0.2, seed=42)
+        fold_drug_feature, fold_side_feature = add_dsa_features(
+            drug_feature,
+            side_feature,
+            drug_side,
+            val_data + test_data,
+            args
+        )
+        auc, PR_auc, rmse, mae, acc, mcc = train_test(
+            fold_drug_feature,
+            fold_side_feature,
+            data[train_split].tolist(),
+            val_data,
+            test_data,
+            fold,
+            args,
+            remain_drug_list,
+            adr_list,
+            output_dir
+        )
         total_rmse.append(rmse)
         total_mae.append(mae)
         total_auc.append(auc)
