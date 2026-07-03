@@ -102,6 +102,67 @@ def get_SMILES_Similarity_forone(SMILES1,data: pd.DataFrame):
             smiles_sim_mat[0][i]=cal_drug_similarityBySmiles(SMILES1,Smile_i)
     return smiles_sim_mat
 
+
+def _tanimoto_matrix(fingerprints, title):
+    """根据指纹列表计算 Tanimoto 相似度矩阵。"""
+    from rdkit import DataStructs
+
+    n = len(fingerprints)
+    sim_mat = np.zeros([n, n], dtype=float)
+    with alive_bar(n, title=title) as bar:
+        for i in range(n):
+            bar()
+            sim_mat[i][i] = 1.0
+            for j in range(i + 1, n):
+                sim = DataStructs.TanimotoSimilarity(fingerprints[i], fingerprints[j])
+                sim_mat[i][j] = sim
+                sim_mat[j][i] = sim
+    return sim_mat
+
+
+def get_MACCS_Similarity(data: pd.DataFrame):
+    """基于 MACCS 指纹计算药物相似度矩阵。"""
+    from rdkit import Chem
+    from rdkit.Chem import MACCSkeys
+
+    print("开始计算MACCS指纹相似性，总数：", str(data.shape[0]))
+    fingerprints = []
+    with alive_bar(data.shape[0], title="生成MACCS指纹") as bar:
+        for i in range(data.shape[0]):
+            bar()
+            mol = Chem.MolFromSmiles(data.loc[i]["SMILES"])
+            fingerprints.append(MACCSkeys.GenMACCSKeys(mol))
+    return _tanimoto_matrix(fingerprints, "MACCS相似度")
+
+
+def get_RDKit_Similarity(data: pd.DataFrame):
+    """基于 RDKit 指纹计算药物相似度矩阵。"""
+    from rdkit import Chem
+
+    print("开始计算RDKit指纹相似性，总数：", str(data.shape[0]))
+    fingerprints = []
+    with alive_bar(data.shape[0], title="生成RDKit指纹") as bar:
+        for i in range(data.shape[0]):
+            bar()
+            mol = Chem.MolFromSmiles(data.loc[i]["SMILES"])
+            fingerprints.append(Chem.RDKFingerprint(mol))
+    return _tanimoto_matrix(fingerprints, "RDKit相似度")
+
+
+def get_Morgan_Similarity(data: pd.DataFrame):
+    """基于 Morgan/ECFP 指纹计算药物相似度矩阵。"""
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    print("开始计算Morgan指纹相似性，总数：", str(data.shape[0]))
+    fingerprints = []
+    with alive_bar(data.shape[0], title="生成Morgan指纹") as bar:
+        for i in range(data.shape[0]):
+            bar()
+            mol = Chem.MolFromSmiles(data.loc[i]["SMILES"])
+            fingerprints.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048))
+    return _tanimoto_matrix(fingerprints, "Morgan相似度")
+
 def get_MESH_Similarity(data: pd.DataFrame):
     print("开始计算MESH相似性，总数：",str(data.shape[0]))
     Mesh_sim_mat = np.zeros([data.shape[0],data.shape[0]], dtype = float, order = 'C')

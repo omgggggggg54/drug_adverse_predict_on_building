@@ -45,9 +45,10 @@ ctd_gene_adr_asso_list_4386.csv
 *.npz
 *.zip
 *.md
-BiMPADR-main/
 *.csv
 *.pdf
+*.txt
+*.html
 __pycache__/
 2drug-2side/
 logs/

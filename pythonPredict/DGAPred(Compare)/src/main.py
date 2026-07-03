@@ -27,7 +27,8 @@ from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
 
 from model.model import DGAPred
-from utils.data_utils import data_feature, jaccard_similarity, Convert_triplelist2matrix
+from utils.data_utils import jaccard_similarity
+from utils.feature_generation import ensure_training_feature_cache, read_ordered_square_feature
 # ChemProp 依赖已移除
 
 # 设置随机种子确保可复现性
@@ -136,67 +137,31 @@ sys.path.insert(0, cur_path + "/..")
 # Data Loading Functions
 # ============================================================================
 
-def load_label(screen_drug_list, use_DGen, use_AGen, args):
-    """Load and construct drug-side effect label matrix.
+def load_label(args):
+    """加载已经准备好的 drug-side effect 标签矩阵。
     
     Args:
-        screen_drug_list: List of drug IDs to screen
-        use_DGen: Whether to filter by drug-gene interactions
-        use_AGen: Whether to filter by gene-disease associations
-        args: Command line arguments
+        args: 命令行参数
         
     Returns:
-        drug_list: List of drug IDs
-        adr_list: List of side effect IDs
-        drug_side: Drug-side effect interaction matrix
+        drug_ids: drug_side 行顺序中的药物ID
+        adr_ids: drug_side 列顺序中的ADR ID
+        drug_side: 药物-ADR标签矩阵
     """
-    drug_col, adr_col = "pert_id", "MESH_ID"
-    
     # Check cache
     cache_filename = "drug_side.csv"
     cache_path = os.path.join(args.similarity_path, cache_filename)
     
-    if os.path.exists(cache_path):
-        print(f"[Cache] Loading from cache: {cache_path}")
-        drug_side = pd.read_csv(cache_path, header=0, index_col=0)
-        return list(drug_side.index), list(drug_side.columns), drug_side
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"缺少标签矩阵缓存: {cache_path}。请先运行 ensure_training_feature_cache。"
+        )
 
-    # Load label data
-    pd_label = pd.read_csv(args.rawpath + "sider_pert_mesh_list.csv", header=0, delimiter='\t')
-    drug_side = data_feature(pd_label, screen_list=screen_drug_list, 
-                             screen_col=drug_col, del_screen_col=False)
-    
-    # Filter by drug-gene interactions
-    if use_DGen:
-        pd_DGen = pd.read_csv(args.rawpath + "ctd_chem_pert_gene_ixns_list.csv", 
-                              header=0, delimiter='\t')
-        drug_list_DGen = sorted(np.unique(pd_DGen[drug_col]).tolist())
-        drug_side = pd.concat([drug_side[drug_side[drug_col] == id] 
-                               for id in drug_list_DGen], ignore_index=True)
-    
-    # Filter by gene-disease associations
-    if use_AGen:
-        pd_AGen = pd.read_csv(args.rawpath + "ctd_gene_adr_asso_list_4386.csv", 
-                              header=0, delimiter='\t')
-        adr_list_Gen = sorted(np.unique(pd_AGen[adr_col]).tolist())
-        drug_side = pd.concat([drug_side[drug_side[adr_col] == id] 
-                               for id in adr_list_Gen], ignore_index=True)
-
-    # Convert to matrix format
-    drug_side = Convert_triplelist2matrix(drug_side, ["pert_id", "MESH_ID", "label"], 
-                                           fillna_val=0)
-    
-    # Save to cache
-    try:
-        os.makedirs(args.rawpath, exist_ok=True)
-        drug_side.to_csv(cache_path, header=True, index=True)
-        print(f"[Cache] Saved label matrix to: {cache_path}")
-    except Exception as e:
-        print(f"[Cache] Save failed: {e}")
-    
+    print(f"[Cache] Loading from cache: {cache_path}")
+    drug_side = pd.read_csv(cache_path, header=0, index_col=0)
     return list(drug_side.index), list(drug_side.columns), drug_side 
 
-def load_drug_feature(screen_drug_list, args):
+def load_drug_feature(drug_ids, args):
     """加载药物相似性特征矩阵。
     
     特征包括:
@@ -205,7 +170,7 @@ def load_drug_feature(screen_drug_list, args):
     - 化学结构 (CS)
     
     Args:
-        screen_drug_list: 药物ID列表
+        drug_ids: drug_side 行顺序中的药物ID
         args: 命令行参数
         
     Returns:
@@ -230,7 +195,11 @@ def load_drug_feature(screen_drug_list, args):
         if name.upper() not in selected:
             print(f"  - {name}: skipped")
             continue
-        feature = np.array(pd.read_csv(os.path.join(args.similarity_path, filename), header=0, index_col=0))
+        feature = read_ordered_square_feature(
+            os.path.join(args.similarity_path, filename),
+            drug_ids,
+            f"药物特征 {name}"
+        )
         drug_features.append(feature)
         print(f"  - {name}: {feature.shape}")
     if len(drug_features) == 0:
@@ -239,22 +208,22 @@ def load_drug_feature(screen_drug_list, args):
     
     return drug_features
 
-def load_adr_feature(screen_adr_list, args):
-    """Load side effect similarity features.
+def load_adr_feature(adr_ids, args):
+    """加载ADR相似性特征矩阵。
     
-    Features include:
-    - MESH ontology similarity
-    - Gene-Disease associations (GDA)
+    特征包括:
+    - MESH本体相似度
+    - 基因-疾病关联(GDA)
     
     Args:
-        screen_adr_list: List of side effect IDs
-        args: Command line arguments
+        adr_ids: drug_side 列顺序中的ADR ID
+        args: 命令行参数
         
     Returns:
-        List of side effect similarity matrices
+        ADR相似性矩阵列表
     """
     print(f"\n{'='*60}")
-    print("Loading Side Effect Features")
+    print("加载ADR特征")
     print(f"{'='*60}")
     
     selected = parse_feature_tokens(args.adr_features)
@@ -264,12 +233,16 @@ def load_adr_feature(screen_adr_list, args):
     ]
 
     side_features = []
-    print(f"\nSide effect features loaded:")
+    print(f"\nADR特征已加载:")
     for name, filename in feature_files:
         if name.upper() not in selected:
             print(f"  - {name}: skipped")
             continue
-        feature = np.array(pd.read_csv(os.path.join(args.similarity_path, filename), header=0, index_col=0))
+        feature = read_ordered_square_feature(
+            os.path.join(args.similarity_path, filename),
+            adr_ids,
+            f"ADR特征 {name}"
+        )
         side_features.append(feature)
         print(f"  - {name}: {feature.shape}")
     if len(side_features) == 0:
@@ -397,7 +370,7 @@ def sparse_multilabel_categorical_crossentropy(y_true=None, y_pred=None, mask_ze
 # Training and Evaluation Functions
 # ============================================================================
 
-def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold, args, remain_drug_list, adr_list, output_dir):
+def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold, args, output_dir):
     """一折的训练和评估函数。
     
     Args:
@@ -408,7 +381,7 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
         data_test: 最终测试样本
         fold: 当前折数
         args: 命令行参数
-        remain_drug_list: 药物ID列表
+        output_dir: 当前训练输出目录
         
     Returns:
         Evaluation metrics (AUC, AUPR, RMSE, MAE, ACC, MCC)
@@ -831,7 +804,7 @@ if __name__ == '__main__':
     parser.add_argument('--dropout2', type=float, default=0.2,metavar='FLOAT', help='Final prediction dropout rate')
     parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数，默认0表示关闭；开启示例：--label_smooth 0.05')
     parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，默认0表示关闭；开启示例：--grad_clip 0.5')
-    parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=False)
+    parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=True)
     parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA',
                         help='药物特征列表，逗号分隔，例如 DGen,GE,CS,Morgan,MACCS,DSA')
     parser.add_argument('--adr_features', type=str, default='MESH,GDA,DSA',
@@ -840,7 +813,7 @@ if __name__ == '__main__':
                         help='启用D4相似性风险负样本降权重采样')
     parser.add_argument('--d4_negative_risk_percentile', type=float, default=90.0,
                         metavar='FLOAT', help='D4高假阴性风险负样本分位阈值')
-    parser.add_argument('--d4_negative_min_weight', type=float, default=0.05,
+    parser.add_argument('--d4_negative_min_weight', type=float, default=0.02,
                         metavar='FLOAT', help='D4高风险负样本最低保留权重')
 
     args = parser.parse_args()
@@ -849,14 +822,17 @@ if __name__ == '__main__':
         args.torch_interop_threads,
         prefer_cuda=torch.cuda.is_available()
     )
-    druglist = pd.read_csv(args.rawpath+"lincs_druglist_ge_go_521.csv")
+    args.rawpath, args.similarity_path = ensure_training_feature_cache(
+        args.rawpath,
+        args.similarity_path
+    )
     
-    remain_drug_list,adr_list, drug_side = load_label(druglist["pert_id"],True,True, args)#drug_sided的行索引remain_drug_list,列索引adr_list
+    drug_ids, adr_ids, drug_side = load_label(args)
     print("drug_side shape:",pd.DataFrame(drug_side).shape)
 
-    # 加载药物和不良反应特征；D4负样本风险评分需要先拿到药物相似性矩阵。
-    drug_feature = load_drug_feature(remain_drug_list, args)
-    side_feature = load_adr_feature(adr_list, args)
+    # 加载药物和不良反应特征；读取时再次校验顺序，防止特征矩阵与标签矩阵错位。
+    drug_feature = load_drug_feature(drug_ids, args)
+    side_feature = load_adr_feature(adr_ids, args)
     
     #不参与训练的负样本，len(final_positive_sample)=len(final_negative_sample)
     addition_negative_sample, final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values, addition_negative_number='all')#分离正负样本并均衡正负样本
@@ -910,8 +886,6 @@ if __name__ == '__main__':
             test_data,
             fold,
             args,
-            remain_drug_list,
-            adr_list,
             output_dir
         )
         total_rmse.append(rmse)
