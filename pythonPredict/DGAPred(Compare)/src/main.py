@@ -28,8 +28,19 @@ from tqdm import tqdm
 
 from model.model import DGAPred
 from utils.data_utils import jaccard_similarity
+from utils.embedding_feature_generation import (
+    ensure_adr_glove_similarity,
+    ensure_drug_embedding_similarity,
+    ensure_drug_unimol_similarity,
+)
 from utils.feature_generation import ensure_training_feature_cache, read_ordered_square_feature
 # ChemProp 依赖已移除
+
+# 本地模型默认放在项目根目录，使用绝对路径避免从其他目录启动脚本时找不到模型。
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+DEFAULT_CHEMBERTA_MODEL_PATH = os.path.join(PROJECT_ROOT, "ChemBERTa")
+DEFAULT_UNIMOL_MODEL_PATH = os.path.join(PROJECT_ROOT, "Uni-Mol")
+DEFAULT_GLOVE_PATH = r"D:\learning\buliangfanying\数据集\glove.6B.300d.txt"
 
 # 设置随机种子确保可复现性
 SEED = 42
@@ -187,6 +198,8 @@ def load_drug_feature(drug_ids, args):
         ("CS", "drug_rdkit.csv"),
         ("Morgan", "drug_morgan.csv"),
         ("MACCS", "drug_maccs.csv"),
+        ("ChemBERTa", "drug_chemberta_sim.csv"),
+        ("Uni-Mol", "drug_unimol_sim.csv"),
     ]
 
     drug_features = []
@@ -195,6 +208,22 @@ def load_drug_feature(drug_ids, args):
         if name.upper() not in selected:
             print(f"  - {name}: skipped")
             continue
+        if name == "ChemBERTa":
+            ensure_drug_embedding_similarity(
+                args.similarity_path,
+                drug_ids,
+                args.chemberta_model_path,
+                filename,
+                name,
+            )
+        elif name == "Uni-Mol":
+            ensure_drug_unimol_similarity(
+                args.similarity_path,
+                drug_ids,
+                args.unimol_model_path,
+                filename,
+                name,
+            )
         feature = read_ordered_square_feature(
             os.path.join(args.similarity_path, filename),
             drug_ids,
@@ -230,6 +259,7 @@ def load_adr_feature(adr_ids, args):
     feature_files = [
         ("MESH", "side_mesh_sim.csv"),
         ("GDA", "adr_GDisease_sim.csv"),
+        ("GloVe", "adr_glove_sim.csv"),
     ]
 
     side_features = []
@@ -238,6 +268,14 @@ def load_adr_feature(adr_ids, args):
         if name.upper() not in selected:
             print(f"  - {name}: skipped")
             continue
+        if name == "GloVe":
+            ensure_adr_glove_similarity(
+                args.similarity_path,
+                adr_ids,
+                args.glove_path,
+                filename,
+                name,
+            )
         feature = read_ordered_square_feature(
             os.path.join(args.similarity_path, filename),
             adr_ids,
@@ -521,11 +559,20 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
     '''构建学习率调度器'''
     scheduler = None
     if args.use_scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)#模型的性能在一段时间内没有提升时，就自动把学习率降低
+        # 验证集综合分数连续不提升时降低学习率，让模型后期不要继续大步覆盖较好的排序边界。
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=0.5,
+            patience=args.scheduler_patience,
+            threshold=args.early_stop_delta,
+            min_lr=args.min_lr
+        )
     
     '''初始化训练指数变量'''
     AUC_mn = 0
     AUPR_mn = 0
+    best_score = -np.inf
 
     rms_mn = 100000
     mae_mn = 100000
@@ -564,12 +611,15 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
         test_epoches.append(test_epoch)
 
 
-        is_better = (v_i_auc > AUC_mn) or (v_iPR_auc > AUPR_mn)
+        # AUC和AUPR都反映分类排序效果，用同一个综合分数保存最佳模型，避免只提升一个指标就覆盖模型。
+        val_score = 0.5 * (v_i_auc + v_iPR_auc)
+        is_better = val_score > best_score + args.early_stop_delta
         if is_better:
-            AUC_mn = max(AUC_mn, v_i_auc)
-            AUPR_mn = max(AUPR_mn, v_iPR_auc)
-            rms_mn = min(rms_mn, v_rmse)
-            mae_mn = min(mae_mn, v_mae)
+            best_score = val_score
+            AUC_mn = v_i_auc
+            AUPR_mn = v_iPR_auc
+            rms_mn = v_rmse
+            mae_mn = v_mae
             endure_count = 0
             # Save best model state
             best_model_state = deepcopy(model.state_dict())
@@ -577,13 +627,14 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
             endure_count += 1
 
         if scheduler is not None:
-            scheduler.step(v_i_auc)
+            scheduler.step(val_score)
 
-        print("Epoch: %d <Val after train-epoch> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
-        epoch, v_rmse, v_mae, v_i_auc, v_iPR_auc, v_acc, v_mcc))
+        current_lr = optimizer.param_groups[0]["lr"]
+        print("Epoch: %d <Val after train-epoch> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f, LR: %.6g " % (
+        epoch, v_rmse, v_mae, v_i_auc, v_iPR_auc, v_acc, v_mcc, current_lr))
         start = time.time()
 
-        if endure_count >15 :
+        if endure_count >= args.early_stop_patience :
             break
     
     '''加载验证阶段表现最好的模型，再做最终测试'''
@@ -673,7 +724,12 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
         
         # 计算损失
         loss1 = lossfunction1(logits, y_target)
-        loss2 = lossfunction2(reconstruction[positive_mask], ratings[positive_mask])
+        # 当前batch可能恰好没有正样本，此时空张量计算MSE会得到nan。
+        # 没有正样本时只训练分类分支，回归损失记为0。
+        if positive_mask.any():
+            loss2 = lossfunction2(reconstruction[positive_mask], ratings[positive_mask])
+        else:
+            loss2 = reconstruction.new_zeros(())
         lambda_cls = 0.7  # 分类任务权重
         total_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
         
@@ -730,7 +786,11 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
         
         # 计算损失
         loss1 = lossfunction1(scores_one, labels)#BCEWithLogitsLoss内部会做sigmoid
-        loss2 = lossfunction2(scores_two[positive_mask], ratings[positive_mask])#在正样本上计算MSELoss
+        # 验证/测试集按顺序取batch时更容易出现无正样本batch，必须跳过回归MSE，否则进度条会显示loss=nan。
+        if positive_mask.any():
+            loss2 = lossfunction2(scores_two[positive_mask], ratings[positive_mask])#在正样本上计算MSELoss
+        else:
+            loss2 = scores_two.new_zeros(())
         lambda_cls = 0.7
         test_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
         test_avg_loss += test_loss.detach().item()
@@ -780,11 +840,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'Model')
     parser.add_argument('--epochs', type = int, default = 120,
                         metavar = 'N', help = 'number of epochs to train')
-    parser.add_argument('--lr', type = float, default = 1e-3,
+    parser.add_argument('--lr', type = float, default = 5e-4,
                         metavar = 'FLOAT', help = 'learning rate')
     parser.add_argument('--embed_dim', type = int, default = 128,
                         metavar = 'N', help = 'embedding dimension')
-    parser.add_argument('--weight_decay', type = float, default = 1e-5,
+    parser.add_argument('--weight_decay', type = float, default = 5e-5,
                         metavar = 'FLOAT', help = 'weight decay')
     parser.add_argument('--batch_size', type = int, default = 128,
                         metavar = 'N', help = 'input batch size for training')
@@ -805,10 +865,24 @@ if __name__ == '__main__':
     parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数，默认0表示关闭；开启示例：--label_smooth 0.05')
     parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，默认0表示关闭；开启示例：--grad_clip 0.5')
     parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=True)
-    parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA',
-                        help='药物特征列表，逗号分隔，例如 DGen,GE,CS,Morgan,MACCS,DSA')
+    parser.add_argument('--scheduler_patience', type=int, default=2,
+                        metavar='N', help='验证综合分数连续多少轮不提升后降低学习率')
+    parser.add_argument('--early_stop_patience', type=int, default=8,
+                        metavar='N', help='验证综合分数连续多少轮不提升后提前停止训练')
+    parser.add_argument('--early_stop_delta', type=float, default=1e-4,
+                        metavar='FLOAT', help='验证综合分数至少提升多少才算真正变好')
+    parser.add_argument('--min_lr', type=float, default=1e-5,
+                        metavar='FLOAT', help='学习率调度器允许降到的最小学习率')
+    parser.add_argument('--chemberta_model_path', type=str, default=DEFAULT_CHEMBERTA_MODEL_PATH,
+                        metavar='STRING', help='本地 ChemBERTa HuggingFace 模型目录')
+    parser.add_argument('--unimol_model_path', type=str, default=DEFAULT_UNIMOL_MODEL_PATH,
+                        metavar='STRING', help='本地 Uni-Mol 权重目录，需包含 mol_pre_no_h_220816.pt 和 mol.dict.txt')
+    parser.add_argument('--glove_path', type=str, default=DEFAULT_GLOVE_PATH,
+                        metavar='STRING', help='本地 GloVe 词向量文件路径')
+    parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA,ChemBERTa',
+                        help='药物特征列表，逗号分隔，例如 DGen,GE,CS,Morgan,MACCS,ChemBERTa,Uni-Mol,DSA')
     parser.add_argument('--adr_features', type=str, default='MESH,GDA,DSA',
-                        help='ADR特征列表，逗号分隔，例如 MESH,GDA,DSA')
+                        help='ADR特征列表，逗号分隔，例如 MESH,GDA,DSA,GloVe')
     parser.add_argument('--use_d4_similarity_negative_weighting', action='store_true',
                         help='启用D4相似性风险负样本降权重采样')
     parser.add_argument('--d4_negative_risk_percentile', type=float, default=90.0,

@@ -4,7 +4,10 @@ import numpy as np
 from utils.clac_dis_mesh_sim import cal_SimilarityByMeSHDAG
 from alive_progress import alive_bar # 显示循环的进度条工具
 from sklearn.metrics import jaccard_score
+import warnings
+from sklearn.exceptions import DataConversionWarning
 
+warnings.filterwarnings("ignore", category=DataConversionWarning)
 
 
 '''适合列表/以列表展示的特征'''
