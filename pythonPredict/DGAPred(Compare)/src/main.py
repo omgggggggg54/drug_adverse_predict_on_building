@@ -34,6 +34,7 @@ from utils.embedding_feature_generation import (
     ensure_drug_unimol_similarity,
 )
 from utils.feature_generation import ensure_training_feature_cache, read_ordered_square_feature
+from utils.rpu_utils import build_rpu_train_samples, to_weighted_train_samples
 # ChemProp 依赖已移除
 
 # 本地模型默认放在项目根目录，使用绝对路径避免从其他目录启动脚本时找不到模型。
@@ -75,69 +76,6 @@ def configure_cpu_threads(torch_threads, torch_interop_threads, prefer_cuda=Fals
 
     print(f"[CPU] torch_threads={torch.get_num_threads()}, "
           f"torch_interop_threads={torch.get_num_interop_threads()}")
-
-
-def build_d4_drug_similarity(drug_features):
-    """融合药物多源相似性矩阵，作为负样本假阴性风险的结构依据。"""
-    normalized_sims = []
-    for sim in drug_features:
-        sim = np.nan_to_num(np.asarray(sim, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        sim_min, sim_max = float(sim.min()), float(sim.max())
-        if sim_min < 0.0 or sim_max > 1.0:
-            sim = (sim - sim_min) / (sim_max - sim_min + 1e-12)
-        normalized_sims.append(np.clip(sim, 0.0, 1.0))
-    return np.mean(normalized_sims, axis=0)
-
-
-def compute_d4_negative_risks(negative_samples, DAL, drug_sim):
-    """计算每个未报告负样本靠近同ADR阳性药物的程度，值越大越像假阴性。"""
-    negative_samples = np.asarray(negative_samples)
-    side_ids = negative_samples[:, 1].astype(int)
-    drug_ids = negative_samples[:, 0].astype(int)
-    risks = np.zeros(len(negative_samples), dtype=np.float32)
-
-    for side_idx in np.unique(side_ids):
-        positive_drugs = np.flatnonzero(DAL[:, side_idx] > 0)
-        if len(positive_drugs) == 0:
-            continue
-        sample_idx = np.flatnonzero(side_ids == side_idx)
-        risks[sample_idx] = drug_sim[drug_ids[sample_idx]][:, positive_drugs].max(axis=1)
-
-    return np.clip(np.nan_to_num(risks, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
-
-
-def d4_similarity_aware_negative_resampling(addition_negative_sample, final_positive_sample,
-                                            final_negative_sample, DAL, drug_features, args):
-    """复用剩余负样本池，对高假阴性风险负样本降权后重新抽取1:1负样本。"""
-    if not args.use_d4_similarity_negative_weighting:
-        return final_negative_sample
-
-    candidate_negative = np.vstack((final_negative_sample, addition_negative_sample))
-    drug_sim = build_d4_drug_similarity(drug_features)
-    risks = compute_d4_negative_risks(candidate_negative, DAL, drug_sim)
-    cutoff = np.percentile(risks, args.d4_negative_risk_percentile)
-
-    # 高于分位阈值的负样本更可能是假阴性，降权但不直接删除，避免过度筛数据。
-    weights = np.where(risks > cutoff, 1.0 - risks, 1.0)
-    weights = np.clip(weights, args.d4_negative_min_weight, 1.0)
-    probs = weights / weights.sum()
-
-    sample_size = len(final_positive_sample)
-    sampled_idx = np.random.choice(len(candidate_negative), size=sample_size, replace=False, p=probs)
-    sampled_negative = candidate_negative[sampled_idx]
-    sampled_risks = risks[sampled_idx]
-
-    args.d4_negative_candidate_count = int(len(candidate_negative))
-    args.d4_negative_sampled_count = int(len(sampled_negative))
-    args.d4_negative_risk_cutoff = float(cutoff)
-    args.d4_negative_risk_mean_before = float(risks.mean())
-    args.d4_negative_risk_mean_after = float(sampled_risks.mean())
-
-    print("[D4] similarity-aware negative weighting enabled")
-    print(f"[D4] negative candidates: {len(candidate_negative)}, sampled negatives: {len(sampled_negative)}")
-    print(f"[D4] risk percentile cutoff: {cutoff:.4f}, min_weight: {args.d4_negative_min_weight:.4f}")
-    print(f"[D4] risk mean before/after: {risks.mean():.4f} / {sampled_risks.mean():.4f}")
-    return sampled_negative
 
 
 # 设置系统路径
@@ -203,6 +141,7 @@ def load_drug_feature(drug_ids, args):
     ]
 
     drug_features = []
+    drug_feature_names = []
     print(f"\n药物特征已加载:")
     for name, filename in feature_files:
         if name.upper() not in selected:
@@ -230,12 +169,13 @@ def load_drug_feature(drug_ids, args):
             f"药物特征 {name}"
         )
         drug_features.append(feature)
+        drug_feature_names.append(name)
         print(f"  - {name}: {feature.shape}")
     if len(drug_features) == 0:
         raise ValueError("至少需要启用一个 drug feature")
     print(f"{'='*60}\n")
     
-    return drug_features
+    return drug_features, drug_feature_names
 
 def load_adr_feature(adr_ids, args):
     """加载ADR相似性特征矩阵。
@@ -263,6 +203,7 @@ def load_adr_feature(adr_ids, args):
     ]
 
     side_features = []
+    side_feature_names = []
     print(f"\nADR特征已加载:")
     for name, filename in feature_files:
         if name.upper() not in selected:
@@ -282,19 +223,17 @@ def load_adr_feature(adr_ids, args):
             f"ADR特征 {name}"
         )
         side_features.append(feature)
+        side_feature_names.append(name)
         print(f"  - {name}: {feature.shape}")
     if len(side_features) == 0:
         raise ValueError("至少需要启用一个 ADR feature")
     print(f"{'='*60}\n")
     
-    return side_features
+    return side_features, side_feature_names
 
 
 def split_val_test(data_test, val_ratio=0.2, seed=42):
-    """从当前测试折里切出验证集和最终测试集。
-
-    只对测试折做二次划分，训练折不变。
-    """
+    """旧评估口径：从当前测试折里切出验证集和最终测试集。"""
     data_test = np.array(data_test)
     labels = data_test[:, 2].astype(int)
     n_splits = max(2, int(round(1.0 / val_ratio)))
@@ -303,12 +242,22 @@ def split_val_test(data_test, val_ratio=0.2, seed=42):
     return data_test[val_idx].tolist(), data_test[test_idx].tolist()
 
 
+def split_train_val(data_train, val_ratio=0.2, seed=42):
+    """严格评估口径：从训练折里切验证集，外层测试折保持完全独立。"""
+    data_train = np.array(data_train)
+    labels = data_train[:, 2].astype(int)
+    n_splits = max(2, int(round(1.0 / val_ratio)))
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    train_idx, val_idx = next(splitter.split(np.zeros(len(labels)), labels))
+    return data_train[train_idx].tolist(), data_train[val_idx].tolist()
+
+
 def parse_feature_tokens(text):
     """把逗号分隔的特征开关字符串转成大写集合。"""
     return {item.strip().upper() for item in str(text).split(",") if item.strip()}
 
 
-def add_dsa_features(drug_features, side_features, drug_side, hidden_data, args):
+def add_dsa_features(drug_features, side_features, drug_feature_names, side_feature_names, drug_side, hidden_data, args):
     """按 DGANet baseline 构造 DSA 特征。
 
     验证集和最终测试集位置会先置 0，避免 DSA 特征看到待评估标签。
@@ -316,7 +265,7 @@ def add_dsa_features(drug_features, side_features, drug_side, hidden_data, args)
     selected_drug = parse_feature_tokens(args.drug_features)
     selected_side = parse_feature_tokens(args.adr_features)
     if "DSA" not in selected_drug and "DSA" not in selected_side:
-        return drug_features, side_features
+        return drug_features, side_features, drug_feature_names, side_feature_names
 
     drug_side_for_sim = drug_side.values.copy()
     hidden_array = np.array(hidden_data)
@@ -326,7 +275,17 @@ def add_dsa_features(drug_features, side_features, drug_side, hidden_data, args)
 
     print(f"[DSA] drug-side similarity: {drug_side_sim.shape}")
     print(f"[DSA] side-drug similarity: {side_drug_sim.shape}")
-    return drug_features + [drug_side_sim], side_features + [side_drug_sim]
+    fold_drug_features = list(drug_features)
+    fold_side_features = list(side_features)
+    fold_drug_feature_names = list(drug_feature_names)
+    fold_side_feature_names = list(side_feature_names)
+    if "DSA" in selected_drug:
+        fold_drug_features.append(drug_side_sim)
+        fold_drug_feature_names.append("DSA")
+    if "DSA" in selected_side:
+        fold_side_features.append(side_drug_sim)
+        fold_side_feature_names.append("DSA")
+    return fold_drug_features, fold_side_features, fold_drug_feature_names, fold_side_feature_names
 
 # ============================================================================
 # Data Preprocessing Functions
@@ -346,7 +305,8 @@ def Extract_positive_negative_samples(DAL, addition_negative_number='all'):
     """
     # Flatten matrix to sample list [drug_idx, adr_idx, label]
     n_samples = DAL.shape[0] * DAL.shape[1] #num_drug*num_adr
-    interaction_target = np.zeros((n_samples, 3), dtype=int)#[num_drug*num_adr, 3]
+    # 第三列保留原始 rating，不能强转 int，避免未来频率/强度标签被截断。
+    interaction_target = np.zeros((n_samples, 3), dtype=np.float32)#[num_drug*num_adr, 3]
     
     k = 0
     for i in range(DAL.shape[0]):
@@ -402,6 +362,16 @@ def sparse_multilabel_categorical_crossentropy(y_true=None, y_pred=None, mask_ze
     return neg_loss + pos_loss
 
 
+def compute_logit_adjustment_bias(args):
+    """按RPU负采样比例做类别先验校正，让0.5阈值重新对应评估集的近似1:1先验。"""
+    if args is None or not getattr(args, "use_logit_adjustment", False):
+        return 0.0
+    if getattr(args, "logit_adjustment_bias", None) is not None:
+        return float(args.logit_adjustment_bias)
+    if not getattr(args, "use_rpu", False):
+        return 0.0
+    ratio = max(float(getattr(args, "rpu_negative_ratio", 1.0)), 1e-6)
+    return float(args.logit_adjustment_strength) * float(np.log(ratio))
 
 
 # ============================================================================
@@ -448,10 +418,15 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
     data_val = np.array(data_val)
     data_test = np.array(data_test)
     
+    if data_train.shape[1] == 3:
+        data_train = to_weighted_train_samples(data_train)
+
     train_indices = (
-        data_train[:, 0].astype(int),  # drug_indices
-        data_train[:, 1].astype(int),  # side_indices
-        data_train[:, 2]               # labels
+        data_train[:, 0].astype(int),      # drug_indices
+        data_train[:, 1].astype(int),      # side_indices
+        data_train[:, 2].astype(np.float32),  # soft_label
+        data_train[:, 3].astype(np.float32),  # rating
+        data_train[:, 4].astype(np.float32),  # sample_weight
     )
     
     val_indices = (
@@ -470,7 +445,9 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
     trainset = torch.utils.data.TensorDataset(
         torch.LongTensor(train_indices[0]),  # drug_indices
         torch.LongTensor(train_indices[1]),  # side_indices
-        torch.FloatTensor(train_indices[2])  # labels
+        torch.FloatTensor(train_indices[2]),  # soft_label
+        torch.FloatTensor(train_indices[3]),  # rating
+        torch.FloatTensor(train_indices[4])   # sample_weight
     )
     valset = torch.utils.data.TensorDataset(
         torch.LongTensor(val_indices[0]),
@@ -531,8 +508,6 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
     '''构建模型'''
     drug_feature_dims = [feature.shape[1] for feature in drug_feature]
     side_feature_dims = [feature.shape[1] for feature in side_feature]
-    if args.use_d4_similarity_negative_weighting:
-        print("[D4] similarity-aware negative weighting enabled for this run")
     model = DGAPred(
         drugs_dim=sum(drug_feature_dims),
         sides_dim=sum(side_feature_dims),
@@ -605,7 +580,8 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
                                                                                                            global_drug_features_tensor,
                                                                                                            global_side_features_tensor,
                                                                                                            lossfunction1=Classification_criterion,
-                                                                                                           lossfunction2=Regression_criterion)
+                                                                                                           lossfunction2=Regression_criterion,
+                                                                                                           args=args)
                                                                                          
         test_epoch = val_iter_loss/val_step
         test_epoches.append(test_epoch)
@@ -646,7 +622,8 @@ def train_test(drug_feature, side_feature, data_train, data_val, data_test, fold
     i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(
         model, _test, device, global_drug_features_tensor, global_side_features_tensor,
         lossfunction1=Classification_criterion,
-        lossfunction2=Regression_criterion
+        lossfunction2=Regression_criterion,
+        args=args
     )
     time_cost = time.time() - final_start
     print("Time: %.2f <Test> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
@@ -696,10 +673,12 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
 
     # 创建进度条
     pbar = tqdm(enumerate(train_loader, 0), total=len(train_loader), desc="Training")
-    for step, (drug_idx, side_idx, ratings) in pbar:
-        # 标签保留 CPU 版本用于 dataloader 输出统计，同时把真正参与训练的张量异步送到 GPU。
+    for step, (drug_idx, side_idx, soft_labels, ratings, sample_weights) in pbar:
+        # E3 训练样本为五列：soft_label 负责分类，rating 只给真实正样本回归，sample_weight 表示负标签可信度。
+        soft_labels = soft_labels.to(device, non_blocking=True)
         ratings = ratings.to(device, non_blocking=True)
-        labels = (ratings > 0).float()
+        sample_weights = sample_weights.to(device, non_blocking=True)
+        real_positive_mask = ratings > 0
         
         optimizer.zero_grad()
         
@@ -711,27 +690,28 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
             global_drug_features=global_drug_features,
             global_side_features=global_side_features
         )
+        # 模型内部使用 squeeze；这里拉平成一维，避免 batch_size=1 时退化成标量。
         logits, reconstruction = model_output
-        
-        positive_mask = labels > 0
+        logits = logits.view(-1)
+        reconstruction = reconstruction.view(-1)
         
         # 标签平滑
         if args.label_smooth > 0:
             eps = float(args.label_smooth)
-            y_target = (1.0 - eps) * labels + 0.5 * eps
+            y_target = (1.0 - eps) * soft_labels + 0.5 * eps
         else:
-            y_target = labels
-        
-        # 计算损失
-        loss1 = lossfunction1(logits, y_target)
-        # 当前batch可能恰好没有正样本，此时空张量计算MSE会得到nan。
-        # 没有正样本时只训练分类分支，回归损失记为0。
-        if positive_mask.any():
-            loss2 = lossfunction2(reconstruction[positive_mask], ratings[positive_mask])
+            y_target = soft_labels
+
+        # 分类分支只保留基础 RPU 负样本加权。
+        raw_bce = nn.functional.binary_cross_entropy_with_logits(logits, y_target, reduction='none')
+        loss1 = (raw_bce * sample_weights).mean()
+
+        # 回归分支只训练真实正样本，避免未观察负样本的 0 rating 污染强度预测。
+        if real_positive_mask.any():
+            loss2 = lossfunction2(reconstruction[real_positive_mask], ratings[real_positive_mask])
         else:
             loss2 = reconstruction.new_zeros(())
-        lambda_cls = 0.7  # 分类任务权重
-        total_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
+        total_loss = args.lambda_cls * loss1 + args.lambda_reg * loss2
         
         total_loss.backward()
         if args.grad_clip is not None and args.grad_clip > 0:
@@ -747,11 +727,12 @@ def train(model, train_loader, optimizer, lossfunction1, lossfunction2, device,
         recent_loss = np.mean(losses[-10:]) if len(losses) >= 10 else np.mean(losses)
         pbar.set_postfix({'loss': f'{recent_loss:.4f}', 'avg': f'{avg_loss/(step+1):.4f}'})
 
-    return avg_loss, step
+    return avg_loss, step + 1
 
-def test(model, test_loader, device, global_drug_features, global_side_features, lossfunction1, lossfunction2):
+def test(model, test_loader, device, global_drug_features, global_side_features, lossfunction1, lossfunction2, args=None):
     """测试函数 - 带进度条和实时指标"""
     model.eval()
+    logit_adjustment_bias = compute_logit_adjustment_bias(args)
     
     pred1 = []
     pred2 = []
@@ -782,21 +763,26 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
             global_drug_features=global_drug_features,
             global_side_features=global_side_features
         )
+        # 测试集最后一个 batch 可能只有1条样本，统一成一维张量后再计算指标。
+        scores_one = scores_one.view(-1)
+        scores_two = scores_two.view(-1)
+        adjusted_scores_one = scores_one + logit_adjustment_bias
         positive_mask = labels > 0
         
         # 计算损失
-        loss1 = lossfunction1(scores_one, labels)#BCEWithLogitsLoss内部会做sigmoid
+        loss1 = lossfunction1(adjusted_scores_one, labels)#BCEWithLogitsLoss内部会做sigmoid
         # 验证/测试集按顺序取batch时更容易出现无正样本batch，必须跳过回归MSE，否则进度条会显示loss=nan。
         if positive_mask.any():
             loss2 = lossfunction2(scores_two[positive_mask], ratings[positive_mask])#在正样本上计算MSELoss
         else:
             loss2 = scores_two.new_zeros(())
-        lambda_cls = 0.7
-        test_loss = lambda_cls * loss1 + (1 - lambda_cls) * loss2
+        lambda_cls = args.lambda_cls if args is not None else 0.7
+        lambda_reg = args.lambda_reg if args is not None else 0.2
+        test_loss = lambda_cls * loss1 + lambda_reg * loss2
         test_avg_loss += test_loss.detach().item()
         
-        # 收集预测结果
-        prob_one = torch.sigmoid(scores_one)
+        # 收集预测结果。RPU使用大量未观察负样本时，logit先验校正只修正概率尺度，不改变排序关系。
+        prob_one = torch.sigmoid(adjusted_scores_one)
         pred1.append(list(prob_one.data.cpu().numpy()))
         pred2.append(list(scores_two.data.cpu().numpy()))
         ground_truth.append(ratings_cpu.tolist())
@@ -832,7 +818,7 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
     acc = metrics.accuracy_score(label_truth, y_pred_bin)
     mcc = metrics.matthews_corrcoef(label_truth, y_pred_bin)
 
-    return i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step
+    return i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step + 1
 
 
 if __name__ == '__main__':
@@ -862,7 +848,7 @@ if __name__ == '__main__':
     # 训练稳健性与正则化
     parser.add_argument('--dropout1', type=float, default=0.4,metavar='FLOAT', help='主特征编码阶段的dropout')
     parser.add_argument('--dropout2', type=float, default=0.2,metavar='FLOAT', help='Final prediction dropout rate')
-    parser.add_argument('--label_smooth', type=float, default=0.05,metavar='FLOAT', help='二分类标签平滑系数，默认0表示关闭；开启示例：--label_smooth 0.05')
+    parser.add_argument('--label_smooth', type=float, default=0.0,metavar='FLOAT', help='二分类标签平滑系数，E3默认关闭')
     parser.add_argument('--grad_clip', type=float, default=0.5,metavar='FLOAT', help='梯度裁剪阈值，默认0表示关闭；开启示例：--grad_clip 0.5')
     parser.add_argument('--use_scheduler', action='store_true', help='启用基于验证AUC的ReduceLROnPlateau学习率调度',default=True)
     parser.add_argument('--scheduler_patience', type=int, default=2,
@@ -879,23 +865,67 @@ if __name__ == '__main__':
                         metavar='STRING', help='本地 Uni-Mol 权重目录，需包含 mol_pre_no_h_220816.pt 和 mol.dict.txt')
     parser.add_argument('--glove_path', type=str, default=DEFAULT_GLOVE_PATH,
                         metavar='STRING', help='本地 GloVe 词向量文件路径')
-    parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA,ChemBERTa',
+    parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA,ChemBERTa,Morgan',
                         help='药物特征列表，逗号分隔，例如 DGen,GE,CS,Morgan,MACCS,ChemBERTa,Uni-Mol,DSA')
     parser.add_argument('--adr_features', type=str, default='MESH,GDA,DSA',
                         help='ADR特征列表，逗号分隔，例如 MESH,GDA,DSA,GloVe')
-    parser.add_argument('--use_d4_similarity_negative_weighting', action='store_true',
-                        help='启用D4相似性风险负样本降权重采样')
-    parser.add_argument('--d4_negative_risk_percentile', type=float, default=90.0,
-                        metavar='FLOAT', help='D4高假阴性风险负样本分位阈值')
-    parser.add_argument('--d4_negative_min_weight', type=float, default=0.02,
-                        metavar='FLOAT', help='D4高风险负样本最低保留权重')
-
+    parser.add_argument('--val_source', choices=['train', 'test'], default='train',
+                        help='验证集来源：train为严格口径，test仅用于复现旧口径')
+    parser.add_argument('--val_ratio', type=float, default=0.2,
+                        metavar='FLOAT', help='验证集划分比例')
+    parser.add_argument('--seed', type=int, default=SEED,
+                        metavar='N', help='RPU负采样随机种子')
+    parser.add_argument('--lambda_cls', type=float, default=0.7,
+                        metavar='FLOAT', help='分类损失权重')
+    parser.add_argument('--lambda_reg', type=float, default=0.2,
+                        metavar='FLOAT', help='回归损失权重')
+    parser.add_argument('--use_logit_adjustment',default=True, action='store_true',
+                        help='启用RPU类别先验logit校正，修正负采样导致的概率整体偏低')
+    parser.add_argument('--logit_adjustment_strength', type=float, default=1.0,
+                        metavar='FLOAT', help='log(rpu_negative_ratio)校正强度，1.0表示完整先验校正')
+    parser.add_argument('--logit_adjustment_bias', type=float, default=None,
+                        metavar='FLOAT', help='手动指定logit校正偏置；设置后覆盖自动计算')
+    parser.add_argument('--use_rpu',default=True, action='store_true',
+                        help='启用RPU-DGAPred E3训练样本构造')
+    parser.add_argument('--rpu_negative_mode', choices=['all_weighted'], default='all_weighted',
+                        help='RPU负样本模式，E3固定为all_weighted')
+    parser.add_argument('--rpu_negative_ratio', type=int, default=10,
+                        metavar='N', help='每个训练正样本对应的未观察负样本数量')
+    parser.add_argument('--rpu_min_neg_weight', type=float, default=0.2,
+                        metavar='FLOAT', help='高风险未观察负样本的最低分类权重')
+    parser.add_argument('--rpu_drug_risk_weight', type=float, default=0.7,
+                        metavar='FLOAT', help='drug-side风险在总风险中的权重')
+    parser.add_argument('--rpu_use_consensus_pseudo',default=True, action='store_true',
+                        help='启用多视图共识伪阳性：多个特征视图一致高分的未知pair会以弱标签加入训练')
+    parser.add_argument('--rpu_consensus_pseudo_ratio', type=float, default=0.1,
+                        metavar='FLOAT', help='伪阳性数量占当前fold真实正样本数的比例，count为0时生效')
+    parser.add_argument('--rpu_consensus_pseudo_count', type=int, default=0,
+                        metavar='N', help='每个fold固定加入的伪阳性数量；0表示按ratio自动计算')
+    parser.add_argument('--rpu_consensus_threshold', type=float, default=0.85,
+                        metavar='FLOAT', help='多视图平均分和单视图同意的高置信阈值')
+    parser.add_argument('--rpu_consensus_min_view_score', type=float, default=0.65,
+                        metavar='FLOAT', help='入选伪阳性时每个视图允许的最低分，防止单视图明显反对')
+    parser.add_argument('--rpu_consensus_max_std', type=float, default=0.08,
+                        metavar='FLOAT', help='多视图分数标准差上限，越小表示共识越严格')
+    parser.add_argument('--rpu_consensus_min_agree_views', type=int, default=2,
+                        metavar='N', help='至少多少个视图需要达到consensus_threshold')
+    parser.add_argument('--rpu_min_pseudo_label', type=float, default=0.6,
+                        metavar='FLOAT', help='伪阳性soft label下限')
+    parser.add_argument('--rpu_max_pseudo_label', type=float, default=0.95,
+                        metavar='FLOAT', help='伪阳性soft label上限')
+    parser.add_argument('--rpu_min_pseudo_weight', type=float, default=0.3,
+                        metavar='FLOAT', help='伪阳性分类损失权重下限')
+    parser.add_argument('--rpu_max_pseudo_weight', type=float, default=0.8,
+                        metavar='FLOAT', help='伪阳性分类损失权重上限')
     args = parser.parse_args()
     configure_cpu_threads(
         args.torch_threads,
         args.torch_interop_threads,
         prefer_cuda=torch.cuda.is_available()
     )
+    if args.use_logit_adjustment:
+        print(f"[LogitAdjustment] bias={compute_logit_adjustment_bias(args):.4f}, "
+              f"strength={args.logit_adjustment_strength}")
     args.rawpath, args.similarity_path = ensure_training_feature_cache(
         args.rawpath,
         args.similarity_path
@@ -905,19 +935,11 @@ if __name__ == '__main__':
     print("drug_side shape:",pd.DataFrame(drug_side).shape)
 
     # 加载药物和不良反应特征；读取时再次校验顺序，防止特征矩阵与标签矩阵错位。
-    drug_feature = load_drug_feature(drug_ids, args)
-    side_feature = load_adr_feature(adr_ids, args)
+    drug_feature, drug_feature_names = load_drug_feature(drug_ids, args)
+    side_feature, side_feature_names = load_adr_feature(adr_ids, args)
     
-    #不参与训练的负样本，len(final_positive_sample)=len(final_negative_sample)
-    addition_negative_sample, final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values, addition_negative_number='all')#分离正负样本并均衡正负样本
-    final_negative_sample = d4_similarity_aware_negative_resampling(
-        addition_negative_sample,
-        final_positive_sample,
-        final_negative_sample,
-        drug_side.values,
-        drug_feature,
-        args
-    )
+    # 外层交叉验证仍使用1:1正负样本，保证验证/测试口径和原DGAPred对照一致。
+    addition_negative_sample, final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values, addition_negative_number='all')
     final_sample = np.vstack((final_positive_sample, final_negative_sample))
     X = final_sample[:, 0::]
     final_target = final_sample[:, final_sample.shape[1] - 1]
@@ -944,18 +966,52 @@ if __name__ == '__main__':
     for k, (train_split, test_split) in enumerate(kfold.split(data_x, data_y)):
         print("==================================fold {} start".format(fold))
         data = np.array(data)
-        val_data, test_data = split_val_test(data[test_split].tolist(), val_ratio=0.2, seed=42)
-        fold_drug_feature, fold_side_feature = add_dsa_features(
+        fold_train_data = data[train_split].tolist()
+        test_data = data[test_split].tolist()
+        if args.val_source == 'train':
+            fold_train_data, val_data = split_train_val(
+                fold_train_data,
+                val_ratio=args.val_ratio,
+                seed=42
+            )
+        else:
+            val_data, test_data = split_val_test(
+                test_data,
+                val_ratio=args.val_ratio,
+                seed=42
+            )
+        print(
+            f"[Fold {fold}] val_source={args.val_source}, "
+            f"train={len(fold_train_data)}, val={len(val_data)}, test={len(test_data)}",
+            flush=True
+        )
+        fold_drug_feature, fold_side_feature, fold_drug_feature_names, fold_side_feature_names = add_dsa_features(
             drug_feature,
             side_feature,
+            drug_feature_names,
+            side_feature_names,
             drug_side,
             val_data + test_data,
             args
         )
+        if args.use_rpu:
+            fold_train_data = build_rpu_train_samples(
+                fold_train_data,
+                val_data + test_data,
+                drug_side.values,
+                fold_drug_feature,
+                fold_side_feature,
+                args,
+                fold,
+                fold_drug_feature_names,
+                fold_side_feature_names,
+            )
+        else:
+            fold_train_data = to_weighted_train_samples(fold_train_data)
         auc, PR_auc, rmse, mae, acc, mcc = train_test(
             fold_drug_feature,
             fold_side_feature,
-            data[train_split].tolist(),
+            fold_train_data,
             val_data,
             test_data,
             fold,
