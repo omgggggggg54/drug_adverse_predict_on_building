@@ -6,16 +6,12 @@
 
 import os
 
-import numpy as np
 import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
 
 from utils.data_utils import (
     Convert_triplelist2matrix,
     data_feature,
-    get_MACCS_Similarity,
     get_MESH_Similarity,
-    get_Morgan_Similarity,
     get_RDKit_Similarity,
     jaccard_similarity,
 )
@@ -23,21 +19,15 @@ from utils.data_utils import (
 
 REQUIRED_FEATURE_FILES = [
     "drug_side.csv",
-    "drug_maccs.csv",
     "drug_rdkit.csv",
-    "drug_morgan.csv",
     "drug_DGen_sim.csv",
-    "drug_ge_sim.csv",
     "side_mesh_sim.csv",
     "adr_GDisease_sim.csv",
 ]
 
 DRUG_FEATURE_FILES = [
-    "drug_maccs.csv",
     "drug_rdkit.csv",
-    "drug_morgan.csv",
     "drug_DGen_sim.csv",
-    "drug_ge_sim.csv",
 ]
 
 ADR_FEATURE_FILES = [
@@ -135,7 +125,7 @@ def build_drug_side_matrix(rawpath):
     pd_label = pd.read_csv(csv_path(rawpath, "sider_pert_mesh_list.csv"), header=0, delimiter="\t")
     pd_lincs_druglist = pd.read_csv(csv_path(rawpath, "lincs_druglist_ge_go_521.csv"), header=0)
     screen_drug_list = pd_lincs_druglist[drug_col].values
-    drug_side = data_feature(pd_label, screen_list=screen_drug_list, screen_col=drug_col, del_screen_col=False)
+    drug_side = data_feature(pd_label, screen_drug_list, drug_col)
 
     pd_dgen = pd.read_csv(csv_path(rawpath, "ctd_chem_pert_gene_ixns_list.csv"), header=0, delimiter="\t")
     drug_set_dgen = set(pd_dgen[drug_col].values)
@@ -145,51 +135,33 @@ def build_drug_side_matrix(rawpath):
     adr_set_gen = set(pd_agen[adr_col].values)
     drug_side = drug_side[drug_side[adr_col].isin(adr_set_gen)].reset_index(drop=True)
 
-    return Convert_triplelist2matrix(drug_side, [drug_col, adr_col, "label"], fillna_val=0)
+    return Convert_triplelist2matrix(drug_side, [drug_col, adr_col, "label"])
 
 
 def generate_drug_features(rawpath, similarity_path, drug_ids, missing_files):
     """按缺失清单生成 drug 侧特征缓存。"""
     drug_ids = list(drug_ids)
 
-    chem_files = {"drug_maccs.csv", "drug_rdkit.csv", "drug_morgan.csv"}
+    chem_files = {"drug_rdkit.csv"}
     if chem_files & missing_files:
         pd_cs = pd.read_csv(csv_path(rawpath, "drug_pert_similes_list.csv"), header=0, delimiter="\t")
-        drug_smiles = data_feature(pd_cs, screen_list=drug_ids, screen_col="pert_id", del_screen_col=False)
+        drug_smiles = data_feature(pd_cs, drug_ids, "pert_id")
         if list(drug_smiles["pert_id"].astype(str)) != drug_ids:
             raise ValueError("drug_pert_similes_list.csv 筛选后顺序与 drug_side 行顺序不一致")
-
-        if "drug_maccs.csv" in missing_files:
-            sim = get_MACCS_Similarity(drug_smiles)
-            save_matrix(sim, csv_path(similarity_path, "drug_maccs.csv"), index=drug_ids, columns=drug_ids)
 
         if "drug_rdkit.csv" in missing_files:
             sim = get_RDKit_Similarity(drug_smiles)
             save_matrix(sim, csv_path(similarity_path, "drug_rdkit.csv"), index=drug_ids, columns=drug_ids)
 
-        if "drug_morgan.csv" in missing_files:
-            sim = get_Morgan_Similarity(drug_smiles)
-            save_matrix(sim, csv_path(similarity_path, "drug_morgan.csv"), index=drug_ids, columns=drug_ids)
-
     if "drug_DGen_sim.csv" in missing_files:
         pd_dgen = pd.read_csv(csv_path(rawpath, "ctd_chem_pert_gene_ixns_list.csv"), header=0, delimiter="\t")
-        drug_dgen = data_feature(pd_dgen, screen_list=drug_ids, screen_col="pert_id", del_screen_col=False)
+        drug_dgen = data_feature(pd_dgen, drug_ids, "pert_id")
         drug_dgen = drug_dgen.drop_duplicates(subset=["pert_id", "GeneSymbol"], keep="first")
         drug_dgen["ixn"] = 1
-        drug_dgen = Convert_triplelist2matrix(drug_dgen, ["pert_id", "GeneSymbol", "ixn"], fillna_val=0)
+        drug_dgen = Convert_triplelist2matrix(drug_dgen, ["pert_id", "GeneSymbol", "ixn"])
         drug_dgen = drug_dgen.reindex(drug_ids, fill_value=0)
         sim = jaccard_similarity(drug_dgen)
         save_matrix(sim, csv_path(similarity_path, "drug_DGen_sim.csv"), index=drug_ids, columns=drug_ids)
-
-    if "drug_ge_sim.csv" in missing_files:
-        pd_ge = pd.read_csv(csv_path(rawpath, "LINCS_Gene_Experssion_signatures_CD.csv"), header=0)
-        drug_ge = data_feature(pd_ge, screen_list=drug_ids, screen_col="pert_id", del_screen_col=False)
-        if list(drug_ge["pert_id"].astype(str)) != drug_ids:
-            raise ValueError("LINCS_Gene_Experssion_signatures_CD.csv 筛选后顺序与 drug_side 行顺序不一致")
-        drug_ge = drug_ge.drop(columns=["pert_id"])
-        sim = cosine_similarity(drug_ge)
-        save_matrix(sim, csv_path(similarity_path, "drug_ge_sim.csv"), index=drug_ids, columns=drug_ids)
-
 
 def generate_adr_features(rawpath, similarity_path, adr_ids, missing_files):
     """按缺失清单生成 ADR 侧特征缓存。"""
@@ -199,7 +171,7 @@ def generate_adr_features(rawpath, similarity_path, adr_ids, missing_files):
         adr_list = pd.DataFrame(adr_ids, columns=["MESH_ID"])
         adr_list_id = adr_list["MESH_ID"].str.replace("MESH:", "", regex=False)
         pd_label = pd.read_csv(csv_path(rawpath, "se_mesh_dict_list.csv"), header=0, delimiter="\t")
-        side_mesh = data_feature(pd_label, screen_list=adr_list_id.values, screen_col="MESH_ID", del_screen_col=False)
+        side_mesh = data_feature(pd_label, adr_list_id.values, "MESH_ID")
         side_mesh_ids = ("MESH:" + side_mesh["MESH_ID"].astype(str)).tolist()
         if side_mesh_ids != adr_ids:
             raise ValueError("se_mesh_dict_list.csv 筛选后顺序与 drug_side 列顺序不一致")
@@ -208,8 +180,8 @@ def generate_adr_features(rawpath, similarity_path, adr_ids, missing_files):
 
     if "adr_GDisease_sim.csv" in missing_files:
         pd_gdisease = pd.read_csv(csv_path(rawpath, "ctd_gene_adr_asso_list_4386.csv"), header=0, delimiter="\t")
-        adr_gdisease = data_feature(pd_gdisease, screen_list=adr_ids, screen_col="MESH_ID", del_screen_col=False)
-        adr_gdisease = Convert_triplelist2matrix(adr_gdisease, ["MESH_ID", "GeneSymbol", "ixn"], fillna_val=0)
+        adr_gdisease = data_feature(pd_gdisease, adr_ids, "MESH_ID")
+        adr_gdisease = Convert_triplelist2matrix(adr_gdisease, ["MESH_ID", "GeneSymbol", "ixn"])
         adr_gdisease = adr_gdisease.reindex(adr_ids, fill_value=0)
         sim = jaccard_similarity(adr_gdisease)
         save_matrix(sim, csv_path(similarity_path, "adr_GDisease_sim.csv"), index=adr_ids, columns=adr_ids)

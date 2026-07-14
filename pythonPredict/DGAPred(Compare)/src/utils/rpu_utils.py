@@ -3,6 +3,22 @@
 import numpy as np
 
 
+# 当前最佳主线的固定 RPU 配置，不再暴露为命令行调参项。
+NEGATIVE_RATIO = 10
+RANDOM_SEED = 42
+MIN_NEG_WEIGHT = 0.2
+DRUG_RISK_WEIGHT = 0.7
+CONSENSUS_PSEUDO_RATIO = 0.1
+CONSENSUS_THRESHOLD = 0.85
+CONSENSUS_MIN_VIEW_SCORE = 0.65
+CONSENSUS_MAX_STD = 0.08
+CONSENSUS_MIN_AGREE_VIEWS = 2
+MIN_PSEUDO_LABEL = 0.6
+MAX_PSEUDO_LABEL = 0.95
+MIN_PSEUDO_WEIGHT = 0.3
+MAX_PSEUDO_WEIGHT = 0.8
+
+
 def _normalize_similarity(sim):
     """把不同来源的相似度矩阵统一压到 [0, 1]，避免某个特征源数值尺度过大。"""
     sim = np.nan_to_num(np.asarray(sim, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -90,6 +106,23 @@ def compute_unobserved_risk(negative_samples, visible_positive_matrix, drug_feat
     return np.clip(np.nan_to_num(risk, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
 
 
+def compute_unobserved_risk_components(
+        negative_samples, visible_positive_matrix, drug_features, side_features):
+    """分别计算每个相似度源的风险，供训练阶段学习融合系数。"""
+    components = []
+    for feature in drug_features:
+        components.append(_compute_view_risk(
+            negative_samples, visible_positive_matrix, [feature], [], alpha=1.0
+        ))
+    for feature in side_features:
+        components.append(_compute_view_risk(
+            negative_samples, visible_positive_matrix, [], [feature], alpha=0.0
+        ))
+    if not components:
+        raise ValueError("可学习融合至少需要一个相似度特征。")
+    return np.column_stack(components).astype(np.float32)
+
+
 def _compute_view_risk(candidate_samples, visible_positive_matrix, drug_features, side_features, alpha):
     """计算单个视图下未知 pair 的潜在阳性分数，允许视图只包含药物或 ADR 一侧。"""
     candidate_samples = np.asarray(candidate_samples)
@@ -134,8 +167,8 @@ def _build_consensus_views(drug_features, side_features, drug_feature_names, sid
     """按业务含义构造多视图，缺失的特征会自动跳过该视图中的对应部分。"""
     view_defs = [
         ("结构视图", ("DGEN", "DSA"), ("GDA", "DSA")),
-        ("化学视图", ("CS", "MORGAN", "MACCS", "CHEMBERTA", "UNI-MOL"), ()),
-        ("语义视图", ("CHEMBERTA",), ("MESH", "GLOVE")),
+        ("化学视图", ("CS",), ()),
+        ("语义视图", (), ("MESH",)),
         ("全特征视图", None, None),
     ]
 
@@ -167,10 +200,7 @@ def build_consensus_pseudo_positive_samples(
     if not getattr(args, "rpu_use_consensus_pseudo", False):
         return empty_train, empty_idx, {}
 
-    if getattr(args, "rpu_consensus_pseudo_count", 0) > 0:
-        pseudo_count = int(args.rpu_consensus_pseudo_count)
-    else:
-        pseudo_count = int(round(positive_count * float(args.rpu_consensus_pseudo_ratio)))
+    pseudo_count = int(round(positive_count * CONSENSUS_PSEUDO_RATIO))
     pseudo_count = min(max(pseudo_count, 0), len(candidate_negative))
     if pseudo_count == 0:
         return empty_train, empty_idx, {}
@@ -188,21 +218,21 @@ def build_consensus_pseudo_positive_samples(
             visible_positive_matrix,
             view_drug_features,
             view_side_features,
-            alpha=args.rpu_drug_risk_weight,
+            alpha=DRUG_RISK_WEIGHT,
         ))
 
     score_matrix = np.vstack(view_scores).astype(np.float32)
     mean_score = score_matrix.mean(axis=0)
     min_score = score_matrix.min(axis=0)
     std_score = score_matrix.std(axis=0)
-    agree_threshold = float(args.rpu_consensus_threshold)
-    min_agree_views = min(int(args.rpu_consensus_min_agree_views), len(view_scores))
+    agree_threshold = CONSENSUS_THRESHOLD
+    min_agree_views = min(CONSENSUS_MIN_AGREE_VIEWS, len(view_scores))
     agree_count = (score_matrix >= agree_threshold).sum(axis=0)
 
     eligible = (
         (mean_score >= agree_threshold) &
-        (min_score >= float(args.rpu_consensus_min_view_score)) &
-        (std_score <= float(args.rpu_consensus_max_std)) &
+        (min_score >= CONSENSUS_MIN_VIEW_SCORE) &
+        (std_score <= CONSENSUS_MAX_STD) &
         (agree_count >= min_agree_views)
     )
     eligible_idx = np.flatnonzero(eligible)
@@ -226,14 +256,14 @@ def build_consensus_pseudo_positive_samples(
 
     soft_label = np.clip(
         selected_score,
-        float(args.rpu_min_pseudo_label),
-        float(args.rpu_max_pseudo_label),
+        MIN_PSEUDO_LABEL,
+        MAX_PSEUDO_LABEL,
     ).astype(np.float32)
     confidence = selected_score * (1.0 - selected_std)
     pseudo_weight = np.clip(
         confidence,
-        float(args.rpu_min_pseudo_weight),
-        float(args.rpu_max_pseudo_weight),
+        MIN_PSEUDO_WEIGHT,
+        MAX_PSEUDO_WEIGHT,
     ).astype(np.float32)
     pseudo_train = np.column_stack((
         selected_pairs[:, 0].astype(np.float32),
@@ -291,7 +321,7 @@ def build_rpu_train_samples(
     if len(candidate_negative) == 0:
         raise ValueError("RPU 未观察负样本候选池为空，无法构造训练集。")
 
-    rng = np.random.default_rng(args.seed + fold)
+    rng = np.random.default_rng(RANDOM_SEED + fold)
 
     if drug_feature_names is None:
         drug_feature_names = [f"DRUG_{idx}" for idx in range(len(drug_features))]
@@ -315,20 +345,25 @@ def build_rpu_train_samples(
     else:
         candidate_negative_for_sampling = candidate_negative
 
-    negative_count = min(int(len(positive_samples) * args.rpu_negative_ratio), len(candidate_negative))
+    negative_count = min(int(len(positive_samples) * NEGATIVE_RATIO), len(candidate_negative))
     negative_count = min(negative_count, len(candidate_negative_for_sampling))
     sampled_idx = rng.choice(len(candidate_negative_for_sampling), size=negative_count, replace=False)
     sampled_negative = candidate_negative_for_sampling[sampled_idx]
 
+    risk_components = None
     if len(sampled_negative) > 0:
         risks = compute_unobserved_risk(
             sampled_negative,
             visible_positive,
             drug_features,
             side_features,
-            alpha=args.rpu_drug_risk_weight,
+            alpha=DRUG_RISK_WEIGHT,
         )
-        negative_weight = np.clip(1.0 - risks, args.rpu_min_neg_weight, 1.0).astype(np.float32)
+        negative_weight = np.clip(1.0 - risks, MIN_NEG_WEIGHT, 1.0).astype(np.float32)
+        if args.rpu_weight_mode == "learnable":
+            risk_components = compute_unobserved_risk_components(
+                sampled_negative, visible_positive, drug_features, side_features
+            )
     else:
         risks = np.zeros(0, dtype=np.float32)
         negative_weight = np.zeros(0, dtype=np.float32)
@@ -348,11 +383,22 @@ def build_rpu_train_samples(
         negative_weight,
     ))
     rpu_train = np.vstack((positive_train, pseudo_train, negative_train))
+    if args.rpu_weight_mode == "learnable":
+        component_count = len(drug_features) + len(side_features)
+        prefix_components = np.zeros(
+            (len(positive_train) + len(pseudo_train), component_count), dtype=np.float32
+        )
+        if risk_components is None:
+            risk_components = np.zeros((len(negative_train), component_count), dtype=np.float32)
+        rpu_train = np.column_stack((
+            rpu_train,
+            np.vstack((prefix_components, risk_components)),
+        ))
     rng.shuffle(rpu_train)
 
     print("[RPU-E3] all_weighted negative sampling enabled")
     print(f"[RPU-E3] train positives: {len(positive_samples)}, pseudo positives: {len(pseudo_train)}, sampled negatives: {len(sampled_negative)}")
-    print(f"[RPU-E3] candidate negatives: {len(candidate_negative)}, negative_ratio: {args.rpu_negative_ratio}")
+    print(f"[RPU-E3] candidate negatives: {len(candidate_negative)}, negative_ratio: {NEGATIVE_RATIO}")
     if len(risks) > 0:
         print(f"[RPU-E3] risk mean/max: {float(risks.mean()):.4f} / {float(risks.max()):.4f}")
         print(f"[RPU-E3] negative weight mean/min: {float(negative_weight.mean()):.4f} / {float(negative_weight.min()):.4f}")

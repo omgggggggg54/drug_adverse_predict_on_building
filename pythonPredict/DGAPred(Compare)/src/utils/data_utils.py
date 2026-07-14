@@ -1,109 +1,44 @@
 # 导入所需的库
-import pandas as pd # 用于处理数据的工具
+import pandas as pd
 import numpy as np
 from utils.clac_dis_mesh_sim import cal_SimilarityByMeSHDAG
-from alive_progress import alive_bar # 显示循环的进度条工具
-from sklearn.metrics import jaccard_score
-import warnings
-from sklearn.exceptions import DataConversionWarning
-
-warnings.filterwarnings("ignore", category=DataConversionWarning)
+from alive_progress import alive_bar
 
 
-'''适合列表/以列表展示的特征'''
-def data_feature(data: pd.DataFrame, screen_list: list=None,screen_col: str=None, del_screen_col=True) -> pd.DataFrame:
-    
-    data = data.copy() # 复制数据，避免后续影响原始数据。 
-    if len(screen_list)>0: # 如果提供了 pred_labels 参数，则执行该代码块。
-        data=pd.concat([data.loc[data[screen_col]==id] for id in screen_list],ignore_index=True)
-        data=data.sort_values(by=screen_col,ascending=[True])
-        if del_screen_col:  data = data.drop(columns=[screen_col]) # 去掉用于筛选药物/ADR的列。
-    elif screen_col:
-        data=data.sort_values(by=screen_col,ascending=[True])
-        if del_screen_col:  data = data.drop(columns=[screen_col]) # 去掉用于筛选药物/ADR的列。
-    return data # 返回最后处理的数据。
+def data_feature(data: pd.DataFrame, entity_ids, entity_column: str) -> pd.DataFrame:
+    """筛选指定实体，并按实体 ID 排序以保持缓存顺序稳定。"""
+    return data[data[entity_column].isin(entity_ids)].sort_values(entity_column).reset_index(drop=True)
 
-def jaccard_similarity(X, Y=None):
-    """
-    计算Jaccard相似度。
-    - 当 Y 为 None 时，返回 X 与自身的相似度矩阵 (n, n)，并带有分块进度与时间日志。
-    - 当 Y 不为 None 时，回退到 sklearn 的逐向量 jaccard_score（较少用）。
-    """
+def jaccard_similarity(X):
+    """计算输入矩阵自身的 Jaccard 相似度矩阵。"""
     import time
     from sklearn.metrics import pairwise_distances
 
-    if Y is None:
-        X_arr = X.values if hasattr(X, 'values') else X
-        n = X_arr.shape[0]
-        start = time.time()
-        print(f"[Jaccard] 开始计算自相似度矩阵，规模: {n}x{n}，特征维度: {X_arr.shape[1]}")
+    X_arr = X.values if hasattr(X, 'values') else X
+    X_bool = np.asarray(X_arr, dtype=bool)
+    n = X_arr.shape[0]
+    start = time.time()
+    print(f"[Jaccard] 开始计算自相似度矩阵，规模: {n}x{n}，特征维度: {X_arr.shape[1]}")
 
-        # 分块计算以便打印进度；块大小可按 n 调整
-        block = max(32, min(256, n // 8 if n >= 128 else n))
-        Sim = np.zeros((n, n), dtype=float)
+    block = max(32, min(256, n // 8 if n >= 128 else n))
+    Sim = np.zeros((n, n), dtype=float)
 
-        # 使用 alive_bar 展示进度（一次推进一个区块的行数）
-        with alive_bar(n, title='[Jaccard] 计算进度', spinner='dots_waves2') as bar:
-            for i in range(0, n, block):
-                j_end = min(i + block, n)
-                # 计算距离(0~1)，再转相似度(1-距离)
-                D_blk = pairwise_distances(X_arr[i:j_end], X_arr, metric='jaccard', n_jobs=1)
-                Sim[i:j_end, :] = 1.0 - D_blk
-                # 推进进度：本区块处理的行数
-                bar(j_end - i)
+    with alive_bar(n, title='[Jaccard] 计算进度', spinner='dots_waves2') as bar:
+        for i in range(0, n, block):
+            j_end = min(i + block, n)
+            distances = pairwise_distances(X_bool[i:j_end], X_bool, metric='jaccard', n_jobs=1)
+            Sim[i:j_end, :] = 1.0 - distances
+            bar(j_end - i)
 
-        # 对角置1；处理NaN
-        np.fill_diagonal(Sim, 1.0)
-        Sim[np.isnan(Sim)] = 0
-        total_cost = time.time() - start
-        print(f"[Jaccard] 完成，总耗时: {total_cost:.1f}s")
-        return Sim
-    else:
-        # Y 不为空：按逐向量 jaccard_score 计算（不常用路径）
-        Sim = jaccard_score(X, Y)
-        return Sim
+    np.fill_diagonal(Sim, 1.0)
+    Sim[np.isnan(Sim)] = 0
+    print(f"[Jaccard] 完成，总耗时: {time.time() - start:.1f}s")
+    return Sim
 
-def Convert_triplelist2matrix(data: pd.DataFrame,pivot_cols=[],fillna_val=0.0):
-    data = data.copy() # 复制数据，避免后续影响原始数据。
-    mat_data=data.pivot(index=pivot_cols[0],columns=pivot_cols[1],values=pivot_cols[2])  
-    mat_data=mat_data.sort_index(axis=0,ascending=True)
-    mat_data=mat_data.sort_index(axis=1,ascending=True)
-    mat_data=mat_data.fillna(fillna_val)
-    return mat_data
-
-def cal_drug_similarityBySmiles(SMILES1,SMILES2):
-    # 惰性导入RDKit，避免Windows多进程环境下的DLL初始化问题
-    from rdkit import Chem, DataStructs
-    mol1=Chem.MolFromSmiles(SMILES1)
-    mol2=Chem.MolFromSmiles(SMILES2)
-    # RDKit指纹（此处无需rdMolDescriptors，直接使用RDKFingerprint）
-    fps1=Chem.RDKFingerprint(mol1)
-    fps2=Chem.RDKFingerprint(mol2)
-    return DataStructs.FingerprintSimilarity(fps1,fps2) 
-
-def get_SMILES_Similarity(data: pd.DataFrame):
-    print("开始计算SMILES相似性，总数：",str(data.shape[0]))
-    smiles_sim_mat = np.zeros([data.shape[0],data.shape[0]], dtype = float, order = 'C')
-    with alive_bar(data.shape[0]) as bar:
-        for i in  range(data.shape[0]):
-            bar()
-            Smile_i=data.loc[i]["SMILES"]
-            for j in range(i):
-                Smile_j = data.loc[j]["SMILES"]
-                smiles_sim_mat[i][j]=cal_drug_similarityBySmiles(Smile_i,Smile_j)
-    smiles_sim_mat = smiles_sim_mat + smiles_sim_mat.T + np.eye(data.shape[0]) 
-    return smiles_sim_mat
-
-
-def get_SMILES_Similarity_forone(SMILES1,data: pd.DataFrame):
-    print("开始计算SMILES相似性，总数：",str(data.shape[0]))
-    smiles_sim_mat = np.zeros([1,data.shape[0]], dtype = float, order = 'C')
-    with alive_bar(data.shape[0]) as bar:
-        for i in  range(data.shape[0]):
-            bar()
-            Smile_i=data.loc[i]["SMILES"]
-            smiles_sim_mat[0][i]=cal_drug_similarityBySmiles(SMILES1,Smile_i)
-    return smiles_sim_mat
+def Convert_triplelist2matrix(data: pd.DataFrame, pivot_cols):
+    """将三列实体关系转换为以 0 填充的矩阵。"""
+    matrix = data.pivot(index=pivot_cols[0], columns=pivot_cols[1], values=pivot_cols[2])
+    return matrix.sort_index(axis=0).sort_index(axis=1).fillna(0)
 
 
 def _tanimoto_matrix(fingerprints, title):
@@ -123,21 +58,6 @@ def _tanimoto_matrix(fingerprints, title):
     return sim_mat
 
 
-def get_MACCS_Similarity(data: pd.DataFrame):
-    """基于 MACCS 指纹计算药物相似度矩阵。"""
-    from rdkit import Chem
-    from rdkit.Chem import MACCSkeys
-
-    print("开始计算MACCS指纹相似性，总数：", str(data.shape[0]))
-    fingerprints = []
-    with alive_bar(data.shape[0], title="生成MACCS指纹") as bar:
-        for i in range(data.shape[0]):
-            bar()
-            mol = Chem.MolFromSmiles(data.loc[i]["SMILES"])
-            fingerprints.append(MACCSkeys.GenMACCSKeys(mol))
-    return _tanimoto_matrix(fingerprints, "MACCS相似度")
-
-
 def get_RDKit_Similarity(data: pd.DataFrame):
     """基于 RDKit 指纹计算药物相似度矩阵。"""
     from rdkit import Chem
@@ -151,20 +71,6 @@ def get_RDKit_Similarity(data: pd.DataFrame):
             fingerprints.append(Chem.RDKFingerprint(mol))
     return _tanimoto_matrix(fingerprints, "RDKit相似度")
 
-
-def get_Morgan_Similarity(data: pd.DataFrame):
-    """基于 Morgan/ECFP 指纹计算药物相似度矩阵。"""
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-
-    print("开始计算Morgan指纹相似性，总数：", str(data.shape[0]))
-    fingerprints = []
-    with alive_bar(data.shape[0], title="生成Morgan指纹") as bar:
-        for i in range(data.shape[0]):
-            bar()
-            mol = Chem.MolFromSmiles(data.loc[i]["SMILES"])
-            fingerprints.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048))
-    return _tanimoto_matrix(fingerprints, "Morgan相似度")
 
 def get_MESH_Similarity(data: pd.DataFrame):
     print("开始计算MESH相似性，总数：",str(data.shape[0]))
