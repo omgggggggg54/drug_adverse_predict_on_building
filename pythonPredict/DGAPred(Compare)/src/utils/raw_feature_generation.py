@@ -69,23 +69,24 @@ def ensure_drug_fingerprint_raw(similarity_path, drug_ids, output_filename, fing
 
 
 def _save_token_feature(token_lists, output_path, ids):
-    """保存变长 token 序列，避免稀疏基因特征展开成大矩阵。"""
-    vocabulary = sorted({token for tokens in token_lists for token in tokens})
-    token_to_id = {token: index + 1 for index, token in enumerate(vocabulary)}
+    """保存变长 token 序列，避免稀疏基因特征展开成大矩阵。
+       按照sorted(token)顺序编码，保证不同实体的 token id 一致。"""
+    vocabulary = sorted({token for tokens in token_lists for token in tokens})#词表
+    token_to_id = {token: index + 1 for index, token in enumerate(vocabulary)}#词表->id映射，0保留给padding，后续embedingbag直接跳过
     offsets = np.zeros(len(token_lists) + 1, dtype=np.int64)
     encoded_lists = []
     for index, tokens in enumerate(token_lists):
-        encoded = np.asarray([token_to_id[token] for token in sorted(tokens)], dtype=np.int32)
+        encoded = np.asarray([token_to_id[token] for token in sorted(tokens)], dtype=np.int32)#无基因实体对应encode=[]
         encoded_lists.append(encoded)
         offsets[index + 1] = offsets[index] + len(encoded)
-    token_ids = np.concatenate(encoded_lists) if encoded_lists else np.zeros(0, dtype=np.int32)
+    token_ids = np.concatenate(encoded_lists)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     np.savez_compressed(
         output_path,
         token_ids=token_ids,
         offsets=offsets,
-        ids=np.asarray([str(item) for item in ids]),
+        ids=np.asarray(ids),
         vocab_size=np.asarray(len(vocabulary) + 1, dtype=np.int64),
     )
     print(
@@ -94,10 +95,10 @@ def _save_token_feature(token_lists, output_path, ids):
     )
 
 
-def read_ordered_token_feature(path, expected_ids, label):
-    """读取 token 缓存，并校验实体顺序和 offsets 完整性。"""
+def read_ordered_mesh_token_feature(path, expected_ids):
+    """读取 ADR MESH token 缓存，供唯一的 MESH EmbeddingBag 使用。"""
     if not os.path.exists(path):
-        raise FileNotFoundError(f"{label} token 缓存不存在: {path}")
+        raise FileNotFoundError(f"MESH token 缓存不存在: {path}")
 
     expected_ids = [str(item) for item in expected_ids]
     with np.load(path, allow_pickle=False) as cache:
@@ -107,19 +108,19 @@ def read_ordered_token_feature(path, expected_ids, label):
         vocab_size = int(cache["vocab_size"])
 
     if ids != expected_ids or len(offsets) != len(expected_ids) + 1:
-        raise ValueError(f"{label} token 缓存与训练矩阵顺序不一致: {path}")
+        raise ValueError(f"MESH token 缓存与训练矩阵顺序不一致: {path}")
     if offsets[0] != 0 or offsets[-1] != len(token_ids) or np.any(np.diff(offsets) < 0):
-        raise ValueError(f"{label} token offsets 非法: {path}")
+        raise ValueError(f"MESH token offsets 非法: {path}")
     return {
         "token_ids": token_ids,
         "offsets": offsets,
         "vocab_size": vocab_size,
-        "name": label,
     }
 
 
 def _ensure_gene_token_feature(rawpath, similarity_path, entity_ids, output_filename, source_filename, entity_column):
-    """从基因关联表流式提取指定实体的去重 GeneSymbol token。"""
+    """从基因关联表流式提取指定实体的去重 GeneSymbol token。
+       按传入的 entity_ids 顺序生成 token 缓存，避免稀疏矩阵展开。"""
     output_path = os.path.join(similarity_path, output_filename)
     if os.path.exists(output_path):
         return output_path
@@ -169,14 +170,14 @@ def ensure_adr_mesh_raw(rawpath, similarity_path, adr_ids, output_filename):
         return output_path
 
     adr_ids = [str(item) for item in adr_ids]
-    node_sets = {adr_id: set() for adr_id in adr_ids}
+    node_sets = {adr_id: set() for adr_id in adr_ids}#{"MESH:D000001": set(祖先节点), "MESH:D000002": set(祖先节点), ...}
     source_path = os.path.join(rawpath, "se_mesh_dict_list.csv")
     with open(source_path, "r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for row in reader:
             adr_id = f"MESH:{row['MESH_ID']}"
             if adr_id in node_sets:
-                node_sets[adr_id].update(str(node) for node in ast.literal_eval(row["Dict_MESH"]).keys())
+                node_sets[adr_id].update(str(node) for node in ast.literal_eval(row["Dict_MESH"]).keys())#“安全的”字符串转字典
 
     _save_token_feature([node_sets[adr_id] for adr_id in adr_ids], output_path, adr_ids)
     return output_path

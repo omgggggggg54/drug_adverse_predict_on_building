@@ -1,6 +1,3 @@
-import numpy as np
-import pandas as pd
-
 def get_DV(disease_dict,delta=0.5):
     DV = 0
     for layer in disease_dict.values():

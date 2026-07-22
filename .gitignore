@@ -52,6 +52,7 @@ ctd_gene_adr_asso_list_4386.csv
 __pycache__/
 2drug-2side/
 logs/
+raw_feature_v2/
 .idea/
 aligned_mapping/
 Plug-play-modules-main/

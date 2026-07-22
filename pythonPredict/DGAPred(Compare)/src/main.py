@@ -29,18 +29,14 @@ from tqdm import tqdm
 from model.model import DGAPred
 from utils.data_utils import jaccard_similarity
 from utils.feature_generation import ensure_training_feature_cache, read_ordered_square_feature
+from utils.gene_feature_v2 import ensure_gene_tfidf_svd
 from utils.raw_feature_generation import (
-    ensure_adr_gene_raw,
     ensure_adr_mesh_raw,
     ensure_drug_fingerprint_raw,
-    ensure_drug_gene_raw,
     read_ordered_raw_feature,
-    read_ordered_token_feature,
+    read_ordered_mesh_token_feature,
 )
-from utils.rpu_utils import MIN_NEG_WEIGHT, build_rpu_train_samples, to_weighted_train_samples
-# ChemProp 依赖已移除
-
-FUSION_REGULARIZATION = 0.01
+from utils.rpu_utils import build_rpu_train_samples, to_weighted_train_samples
 
 # 设置随机种子确保可复现性
 SEED = 42
@@ -86,119 +82,47 @@ sys.path.insert(0, cur_path + "/..")
 # ============================================================================
 
 def load_label(args):
-    """加载已经准备好的 drug-side effect 标签矩阵。
-    
-    Args:
-        args: 命令行参数
-        
-    Returns:
-        drug_ids: drug_side 行顺序中的药物ID
-        adr_ids: drug_side 列顺序中的ADR ID
-        drug_side: 药物-ADR标签矩阵
-    """
-    # Check cache
-    cache_filename = "drug_side.csv"
-    cache_path = os.path.join(args.similarity_path, cache_filename)
-    
-    if not os.path.exists(cache_path):
-        raise FileNotFoundError(
-            f"缺少标签矩阵缓存: {cache_path}。请先运行 ensure_training_feature_cache。"
-        )
-
+    """加载训练标签矩阵。"""
+    cache_path = os.path.join(args.similarity_path, "drug_side.csv")
     print(f"[Cache] Loading from cache: {cache_path}")
     drug_side = pd.read_csv(cache_path, header=0, index_col=0)
-    return list(drug_side.index), list(drug_side.columns), drug_side 
+    return list(drug_side.index), list(drug_side.columns), drug_side
 
-def load_drug_feature(drug_ids, args):
-    """加载药物相似性特征矩阵。
-    
-    特征包括:
-    - 药物-基因相互作用 (DGen)
-    - 基因表达 (GE) 
-    - 化学结构 (CS)
-    
-    Args:
-        drug_ids: drug_side 行顺序中的药物ID
-        args: 命令行参数
-        
-    Returns:
-        药物相似性矩阵列表
-    """
-    print(f"\n{'='*60}")
-    print("加载药物特征")
-    print(f"{'='*60}")
-    
-    selected = parse_feature_tokens(args.drug_features)
-    feature_files = [
-        ("DGen", "drug_DGen_sim.csv"),
-        ("CS", "drug_rdkit.csv"),
-    ]
 
+SIMILARITY_DRUG_FEATURES = [
+    ("DGen", "drug_DGen_sim.csv"),
+    ("CS", "drug_rdkit.csv"),
+]
+
+SIMILARITY_ADR_FEATURES = [
+    ("MESH", "side_mesh_sim.csv"),
+    ("GDA", "adr_GDisease_sim.csv"),
+]
+
+
+def load_similarity_features(drug_ids, adr_ids, args):
+    """加载固定相似度视图，供 RPU 及 similarity 模式预测共同使用。"""
     drug_features = []
+    side_features = []
     drug_feature_names = []
-    print(f"\n药物特征已加载:")
-    for name, filename in feature_files:
-        if name.upper() not in selected:
-            print(f"  - {name}: skipped")
-            continue
+    side_feature_names = []
+
+    for name, filename in SIMILARITY_DRUG_FEATURES:
         feature = read_ordered_square_feature(
-            os.path.join(args.similarity_path, filename),
-            drug_ids,
-            f"药物特征 {name}"
+            os.path.join(args.similarity_path, filename), drug_ids, f"药物相似度 {name}"
         )
         drug_features.append(feature)
         drug_feature_names.append(name)
-        print(f"  - {name}: {feature.shape}")
-    if len(drug_features) == 0:
-        raise ValueError("至少需要启用一个 drug feature")
-    print(f"{'='*60}\n")
-    
-    return drug_features, drug_feature_names
 
-def load_adr_feature(adr_ids, args):
-    """加载ADR相似性特征矩阵。
-    
-    特征包括:
-    - MESH本体相似度
-    - 基因-疾病关联(GDA)
-    
-    Args:
-        adr_ids: drug_side 列顺序中的ADR ID
-        args: 命令行参数
-        
-    Returns:
-        ADR相似性矩阵列表
-    """
-    print(f"\n{'='*60}")
-    print("加载ADR特征")
-    print(f"{'='*60}")
-    
-    selected = parse_feature_tokens(args.adr_features)
-    feature_files = [
-        ("MESH", "side_mesh_sim.csv"),
-        ("GDA", "adr_GDisease_sim.csv"),
-    ]
-
-    side_features = []
-    side_feature_names = []
-    print(f"\nADR特征已加载:")
-    for name, filename in feature_files:
-        if name.upper() not in selected:
-            print(f"  - {name}: skipped")
-            continue
+    for name, filename in SIMILARITY_ADR_FEATURES:
         feature = read_ordered_square_feature(
-            os.path.join(args.similarity_path, filename),
-            adr_ids,
-            f"ADR特征 {name}"
+            os.path.join(args.similarity_path, filename), adr_ids, f"ADR 相似度 {name}"
         )
         side_features.append(feature)
         side_feature_names.append(name)
-        print(f"  - {name}: {feature.shape}")
-    if len(side_features) == 0:
-        raise ValueError("至少需要启用一个 ADR feature")
-    print(f"{'='*60}\n")
-    
-    return side_features, side_feature_names
+
+    print(f"[Similarity] drug={drug_feature_names}, adr={side_feature_names}")
+    return drug_features, side_features, drug_feature_names, side_feature_names
 
 
 def split_val_test(data_test, val_ratio=0.2, seed=42):
@@ -221,170 +145,74 @@ def split_train_val(data_train, val_ratio=0.2, seed=42):
     return data_train[train_idx].tolist(), data_train[val_idx].tolist()
 
 
-def parse_feature_tokens(text):
-    """把逗号分隔的特征开关字符串转成大写集合。"""
-    disabled_tokens = {"", "NONE", "NULL", "OFF", "FALSE"}
-    return {
-        item.strip().upper()
-        for item in str(text or "").split(",")
-        if item.strip().upper() not in disabled_tokens
-    }
+def load_tfidf_svd_features(drug_ids, adr_ids, args, gene_svd):
+    """加载 TF-IDF-SVD dense 特征和 ADR MESH token 特征。"""
+    drug_dense_features = {}
+    side_dense_features = {}
+    output_path = os.path.join(args.similarity_path, "drug_rdkit_raw.npz")
+    ensure_drug_fingerprint_raw(args.similarity_path, drug_ids, "drug_rdkit_raw.npz", "rdkit")
+    drug_dense_features["CS"] = read_ordered_raw_feature(output_path, drug_ids, "CS")
+
+    mesh_path = os.path.join(args.similarity_path, "adr_mesh_raw_tokens.npz")
+    ensure_adr_mesh_raw(args.rawpath, args.similarity_path, adr_ids, "adr_mesh_raw_tokens.npz")#编码成token id存成npz文件
+    mesh_token_feature = read_ordered_mesh_token_feature(mesh_path, adr_ids)
+    drug_dense_features["DGEN_TFIDF_SVD"] = gene_svd["drug_svd"]
+    side_dense_features["GDA_TFIDF_SVD"] = gene_svd["adr_svd"]
+
+    print(
+        f"[RawFeature] drug_dense={list(drug_dense_features)}, "
+        f"adr_dense={list(side_dense_features)}, adr_token=MESH"#输出keys
+    )
+    return drug_dense_features, side_dense_features, mesh_token_feature
 
 
-RAW_DRUG_DENSE_FEATURE_SPECS = [
-    ("CS", "CS", "drug_rdkit_raw.npz", "rdkit"),
-]
+def build_tfidf_svd_prediction_features(
+        drug_dense_features, side_dense_features, drug_side, hidden_data):
+    """构造 TF-IDF-SVD 模式预测输入，并追加当前 fold 可见的二值 DSARaw。"""
+    visible = drug_side.values.astype(np.float32, copy=True)
+    hidden = np.asarray(hidden_data)
+    visible[hidden[:, 0].astype(int), hidden[:, 1].astype(int)] = 0.0
+    visible = (visible > 0).astype(np.float32)
 
-RAW_DRUG_TOKEN_FEATURE_SPECS = [
-    ("DGEN", "DGen", "drug_dgen_raw_tokens.npz"),
-]
-
-RAW_ADR_DENSE_FEATURE_SPECS = []
-
-RAW_ADR_TOKEN_FEATURE_SPECS = [
-    ("MESH", "MESH", "adr_mesh_raw_tokens.npz"),
-    ("GDA", "GDA", "adr_gda_raw_tokens.npz"),
-]
-
-
-def normalize_raw_configuration(args):
-    """统一 raw 参数语义，none 模式强制清空所有原始特征选择。"""
-    args.raw_feature_mode = str(args.raw_feature_mode or "none").strip().lower()
-    if args.raw_feature_mode == "none":
-        args.raw_drug_features = ""
-        args.raw_adr_features = ""
-        return
-    args.raw_drug_features = args.raw_drug_features or "DGen,CS"
-    args.raw_adr_features = args.raw_adr_features or "MESH,GDA"
-
-
-def load_raw_drug_features(drug_ids, args):
-    """加载可直接输入模型的药物原始表示。"""
-    if args.raw_feature_mode == "none":
-        return {}, {}
-    selected = parse_feature_tokens(args.raw_drug_features)
-    dense_features = {}
-    token_features = {}
-    for token, source_name, filename, fingerprint_type in RAW_DRUG_DENSE_FEATURE_SPECS:
-        if token not in selected:
-            continue
-        output_path = os.path.join(args.similarity_path, filename)
-        ensure_drug_fingerprint_raw(args.similarity_path, drug_ids, filename, fingerprint_type)
-        feature = read_ordered_raw_feature(output_path, drug_ids, source_name)
-        dense_features[source_name.upper()] = feature
-        print(f"[RawFeature] drug {source_name}: {feature.shape}")
-    for token, source_name, filename in RAW_DRUG_TOKEN_FEATURE_SPECS:
-        if token not in selected:
-            continue
-        output_path = os.path.join(args.similarity_path, filename)
-        ensure_drug_gene_raw(args.rawpath, args.similarity_path, drug_ids, filename)
-        feature = read_ordered_token_feature(output_path, drug_ids, source_name)
-        token_features[source_name.upper()] = feature
-        print(f"[RawFeature] drug {source_name}: token_count={len(feature['token_ids'])}, "
-              f"vocab={feature['vocab_size']}")
-    return dense_features, token_features
-
-
-def load_raw_adr_features(adr_ids, args):
-    """加载可直接输入模型的 ADR 原始表示。"""
-    if args.raw_feature_mode == "none":
-        return {}, {}
-    selected = parse_feature_tokens(args.raw_adr_features)
-    dense_features = {}
-    token_features = {}
-    for token, source_name, filename in RAW_ADR_TOKEN_FEATURE_SPECS:
-        if token not in selected:
-            continue
-        output_path = os.path.join(args.similarity_path, filename)
-        if token == "MESH":
-            ensure_adr_mesh_raw(args.rawpath, args.similarity_path, adr_ids, filename)
-        else:
-            ensure_adr_gene_raw(args.rawpath, args.similarity_path, adr_ids, filename)
-        feature = read_ordered_token_feature(output_path, adr_ids, source_name)
-        token_features[source_name.upper()] = feature
-        print(f"[RawFeature] ADR {source_name}: token_count={len(feature['token_ids'])}, "
-              f"vocab={feature['vocab_size']}")
-    return dense_features, token_features
-
-
-def raw_dense_feature_list(raw_features):
-    """按缓存配置顺序返回 raw-only 模型中的 dense 特征视图。"""
-    return list(raw_features.values()), list(raw_features.keys())
-
-
-def add_raw_dsa_features(drug_features, side_features, drug_feature_names, side_feature_names, drug_side, hidden_data, args):
-    """为 raw-only 模型加入 fold-safe 的原始 drug-ADR 关联 profile。"""
-    selected_drug = parse_feature_tokens(args.drug_features)
-    selected_side = parse_feature_tokens(args.adr_features)
-    if "DSA" not in selected_drug and "DSA" not in selected_side:
-        return drug_features, side_features, drug_feature_names, side_feature_names
-
-    visible_profile = drug_side.values.astype(np.float32, copy=True)
-    hidden_array = np.asarray(hidden_data)
-    visible_profile[hidden_array[:, 0].astype(int), hidden_array[:, 1].astype(int)] = 0.0
-    if "DSA" in selected_drug:
-        drug_features.append(visible_profile)
-        drug_feature_names.append("DSARaw")
-    if "DSA" in selected_side:
-        side_features.append(visible_profile.T)
-        side_feature_names.append("DSARaw")
+    drug_features = list(drug_dense_features.values()) + [visible]
+    side_features = list(side_dense_features.values()) + [visible.T]
+    drug_feature_names = list(drug_dense_features) + ["DSARaw"]
+    side_feature_names = list(side_dense_features) + ["DSARaw"]
     return drug_features, side_features, drug_feature_names, side_feature_names
 
 
-def build_dense_feature_matrix(features, entity_count):
-    """拼接 dense 特征；纯 token 一侧保留零宽矩阵供模型统一索引。"""
-    if not features:
-        return np.zeros((entity_count, 0), dtype=np.float32)
+def build_dense_feature_matrix(features):
+    """拼接实体的 dense 特征。"""
     return np.hstack(features).astype(np.float32)
 
 
-def move_token_features_to_device(token_features, device):
-    """将原始 token 缓存一次性转为训练设备上的只读张量。"""
-    if not token_features:
-        return None
-    return [
-        (
-            torch.as_tensor(feature["token_ids"], dtype=torch.long, device=device),
-            torch.as_tensor(feature["offsets"], dtype=torch.long, device=device),
-        )
-        for feature in token_features.values()
-    ]
+def move_mesh_token_feature_to_device(mesh_token_feature, device):
+    """将 ADR MESH token 缓存一次性转为训练设备上的只读张量。"""
+    return (
+        torch.as_tensor(mesh_token_feature["token_ids"], dtype=torch.long, device=device),
+        torch.as_tensor(mesh_token_feature["offsets"], dtype=torch.long, device=device),
+    )
 
-
-def token_feature_entity_count(token_features):
-    """从任意一个 token 特征的 offsets 推断实体数量。"""
-    first_feature = next(iter(token_features.values()))
-    return first_feature["offsets"].shape[0] - 1
-
-
-def add_dsa_features(drug_features, side_features, drug_feature_names, side_feature_names, drug_side, hidden_data, args):
-    """按 DGANet baseline 构造 DSA 特征。
-
-    验证集和最终测试集位置会先置 0，避免 DSA 特征看到待评估标签。
-    """
-    selected_drug = parse_feature_tokens(args.drug_features)
-    selected_side = parse_feature_tokens(args.adr_features)
-    if "DSA" not in selected_drug and "DSA" not in selected_side:
-        return drug_features, side_features, drug_feature_names, side_feature_names
-
+def build_fold_similarity_features(
+        drug_features, side_features, drug_feature_names, side_feature_names,
+        drug_side, hidden_data):
+    """追加 fold-safe Jaccard DSA，供固定 RPU 与 similarity 模式共同使用。"""
     drug_side_for_sim = drug_side.values.copy()
     hidden_array = np.array(hidden_data)
     drug_side_for_sim[hidden_array[:, 0].astype(int), hidden_array[:, 1].astype(int)] = 0
     drug_side_sim = jaccard_similarity(drug_side_for_sim)
     side_drug_sim = jaccard_similarity(drug_side_for_sim.T)
 
-    print(f"[DSA] drug-side similarity: {drug_side_sim.shape}")
-    print(f"[DSA] side-drug similarity: {side_drug_sim.shape}")
+    print(f"[RPU-DSA] drug similarity: {drug_side_sim.shape}")
+    print(f"[RPU-DSA] ADR similarity: {side_drug_sim.shape}")
     fold_drug_features = list(drug_features)
     fold_side_features = list(side_features)
     fold_drug_feature_names = list(drug_feature_names)
     fold_side_feature_names = list(side_feature_names)
-    if "DSA" in selected_drug:
-        fold_drug_features.append(drug_side_sim)
-        fold_drug_feature_names.append("DSA")
-    if "DSA" in selected_side:
-        fold_side_features.append(side_drug_sim)
-        fold_side_feature_names.append("DSA")
+    fold_drug_features.append(drug_side_sim)
+    fold_drug_feature_names.append("DSA")
+    fold_side_features.append(side_drug_sim)
+    fold_side_feature_names.append("DSA")
     return fold_drug_features, fold_side_features, fold_drug_feature_names, fold_side_feature_names
 
 # ============================================================================
@@ -419,14 +247,9 @@ def Extract_positive_negative_samples(DAL):
     return final_positive_sample, final_negative_sample
 
 
-def compute_logit_adjustment_bias(args):
-    """按RPU负采样比例做类别先验校正，让0.5阈值重新对应评估集的近似1:1先验。"""
-    if args is None or not getattr(args, "use_logit_adjustment", False):
-        return 0.0
-    if not getattr(args, "use_rpu", False):
-        return 0.0
-    ratio = 10.0
-    return float(np.log(ratio))
+def compute_logit_adjustment_bias(use_rpu):
+    """按固定 RPU 负采样比例校正分类阈值对应的先验。"""
+    return float(np.log(10.0)) if use_rpu else 0.0
 
 
 # ============================================================================
@@ -435,8 +258,7 @@ def compute_logit_adjustment_bias(args):
 
 def train_test(
         drug_feature, side_feature, data_train, data_val, data_test, fold, args, output_dir,
-        raw_drug_token_features=None, raw_side_token_features=None,
-        token_feature_mode="none"):
+        mesh_token_feature):
     """一折的训练和评估函数。
     
     Args:
@@ -459,10 +281,8 @@ def train_test(
 
     
     '''构建全局特征矩阵'''
-    drug_entity_count = drug_feature[0].shape[0] if drug_feature else token_feature_entity_count(raw_drug_token_features)
-    side_entity_count = side_feature[0].shape[0] if side_feature else token_feature_entity_count(raw_side_token_features)
-    drug_features_matrix_global = build_dense_feature_matrix(drug_feature, drug_entity_count)
-    side_features_matrix_global = build_dense_feature_matrix(side_feature, side_entity_count)
+    drug_features_matrix_global = build_dense_feature_matrix(drug_feature)
+    side_features_matrix_global = build_dense_feature_matrix(side_feature)
     
     global_drug_features_tensor = torch.FloatTensor(drug_features_matrix_global)
     global_side_features_tensor = torch.FloatTensor(side_features_matrix_global)
@@ -473,9 +293,6 @@ def train_test(
     data_val = np.array(data_val)
     data_test = np.array(data_test)
     
-    if data_train.shape[1] == 3:
-        data_train = to_weighted_train_samples(data_train)
-
     train_indices = (
         data_train[:, 0].astype(int),      # drug_indices
         data_train[:, 1].astype(int),      # side_indices
@@ -483,7 +300,6 @@ def train_test(
         data_train[:, 3].astype(np.float32),  # rating
         data_train[:, 4].astype(np.float32),  # sample_weight
     )
-    train_risk_components = data_train[:, 5:].astype(np.float32)
     
     val_indices = (
         data_val[:, 0].astype(int),
@@ -505,8 +321,6 @@ def train_test(
         torch.FloatTensor(train_indices[3]),  # rating
         torch.FloatTensor(train_indices[4])   # sample_weight
     ]
-    if train_risk_components.shape[1] > 0:
-        train_tensors.append(torch.FloatTensor(train_risk_components))
     trainset = torch.utils.data.TensorDataset(*train_tensors)
     valset = torch.utils.data.TensorDataset(
         torch.LongTensor(val_indices[0]),
@@ -522,21 +336,20 @@ def train_test(
     '''配置cuda加速'''
     torch.backends.cudnn.benchmark = True
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    use_cuda = False
-    if torch.cuda.is_available():
-        use_cuda = True
+    use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("high")
 
     # 全局特征矩阵很小，直接每个 fold 只搬一次到 GPU，避免每个 batch 重复整表拷贝。
     global_drug_features_tensor = global_drug_features_tensor.to(device, non_blocking=use_cuda)
     global_side_features_tensor = global_side_features_tensor.to(device, non_blocking=use_cuda)
-    global_raw_drug_token_features = move_token_features_to_device(raw_drug_token_features, device)
-    global_raw_side_token_features = move_token_features_to_device(raw_side_token_features, device)
+    global_mesh_token_feature = (
+        move_mesh_token_feature_to_device(mesh_token_feature, device)
+        if mesh_token_feature is not None else None
+    )
 
     # 当前数据集已经在内存里，额外 worker 反而会放大 CPU 调度和拷贝开销。
     _val = torch.utils.data.DataLoader(
@@ -564,8 +377,6 @@ def train_test(
         pin_memory=use_cuda
     )
 
-    # ChemProp 编码器已移除
-    
     '''构建模型'''
     drug_feature_dims = [feature.shape[1] for feature in drug_feature]
     side_feature_dims = [feature.shape[1] for feature in side_feature]
@@ -573,26 +384,15 @@ def train_test(
         drugs_dim=sum(drug_feature_dims),
         sides_dim=sum(side_feature_dims),
         embed_dim=args.embed_dim,
-        batchsize=args.batch_size,
         dropout1=args.dropout1,
         dropout2=args.dropout2,
         drug_feature_dims=drug_feature_dims,
         side_feature_dims=side_feature_dims,
-        drug_token_vocab_sizes=[] if not raw_drug_token_features else [
-            feature["vocab_size"] for feature in raw_drug_token_features.values()
-        ],
-        side_token_vocab_sizes=[] if not raw_side_token_features else [
-            feature["vocab_size"] for feature in raw_side_token_features.values()
-        ],
-        token_feature_mode=token_feature_mode,
+        mesh_vocab_size=(
+            mesh_token_feature["vocab_size"]
+            if mesh_token_feature is not None else None
+        ),
     ).to(device)
-    if args.rpu_weight_mode == "learnable":
-        component_count = train_risk_components.shape[1]
-        if component_count == 0:
-            raise ValueError("learnable 权重模式没有收到各特征风险分量。")
-        # 初始 softmax 为等权融合，训练后只学习少量全局系数，不开放逐样本自由权重。
-        model.rpu_fusion_logits = nn.Parameter(torch.zeros(component_count, device=device))
-        print(f"[RPU-Weight] learnable fusion components={component_count}")
     
     '''构建损失函数和优化器'''
     Regression_criterion = nn.MSELoss()
@@ -624,15 +424,9 @@ def train_test(
     AUPR_mn = 0
     best_score = -np.inf
 
-    rms_mn = 100000
-    mae_mn = 100000
     endure_count = 0
     best_model_state = None  # Save best model state
 
-    start = time.time()
-    train_epoches = []
-    test_epoches = []
-    
     '''训练'''
     for epoch in range(1, args.epochs + 1):
         iter_loss_sum, step = train(
@@ -643,28 +437,19 @@ def train_test(
             device,
             global_drug_features_tensor,
             global_side_features_tensor,
-            global_raw_drug_token_features,
-            global_raw_side_token_features,
+            global_mesh_token_feature,
             args=args,
         )  # 一个iterater
-        train_epoch = iter_loss_sum/step
-        train_epoches.append(train_epoch)
-        
         v_i_auc, v_iPR_auc, v_rmse, v_mae, v_acc, v_mcc, v_ground_i, v_ground_u, v_ground_truth, v_pred1, v_pred2, val_iter_loss, val_step = test(model,
                                                                                                            _val,
                                                                                                            device,
                                                                                                            global_drug_features_tensor,
                                                                                                            global_side_features_tensor,
-                                                                                                           global_raw_drug_token_features,
-                                                                                                           global_raw_side_token_features,
+                                                                                                           global_mesh_token_feature,
                                                                                                            lossfunction1=Classification_criterion,
                                                                                                            lossfunction2=Regression_criterion,
                                                                                                            args=args)
                                                                                          
-        test_epoch = val_iter_loss/val_step
-        test_epoches.append(test_epoch)
-
-
         # AUC和AUPR都反映分类排序效果，用同一个综合分数保存最佳模型，避免只提升一个指标就覆盖模型。
         val_score = 0.5 * (v_i_auc + v_iPR_auc)
         is_better = val_score > best_score + args.early_stop_delta
@@ -672,8 +457,6 @@ def train_test(
             best_score = val_score
             AUC_mn = v_i_auc
             AUPR_mn = v_iPR_auc
-            rms_mn = v_rmse
-            mae_mn = v_mae
             endure_count = 0
             # Save best model state
             best_model_state = deepcopy(model.state_dict())
@@ -686,23 +469,17 @@ def train_test(
         current_lr = optimizer.param_groups[0]["lr"]
         print("Epoch: %d <Val after train-epoch> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f, LR: %.6g " % (
         epoch, v_rmse, v_mae, v_i_auc, v_iPR_auc, v_acc, v_mcc, current_lr))
-        start = time.time()
-
         if endure_count >= args.early_stop_patience :
             break
     
     '''加载验证阶段表现最好的模型，再做最终测试'''
     
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"\n[Info] Loaded best model from validation (AUC: {AUC_mn:.5f}, AUPR: {AUPR_mn:.5f})")
-    if args.rpu_weight_mode == "learnable":
-        fusion_weights = torch.softmax(model.rpu_fusion_logits.detach(), dim=0).cpu().numpy()
-        print(f"[RPU-Weight] best fusion weights={np.round(fusion_weights, 4).tolist()}")
+    model.load_state_dict(best_model_state)
+    print(f"\n[Info] Loaded best model from validation (AUC: {AUC_mn:.5f}, AUPR: {AUPR_mn:.5f})")
     final_start = time.time()
     i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(
         model, _test, device, global_drug_features_tensor, global_side_features_tensor,
-        global_raw_drug_token_features, global_raw_side_token_features,
+        global_mesh_token_feature,
         lossfunction1=Classification_criterion,
         lossfunction2=Regression_criterion,
         args=args
@@ -714,7 +491,7 @@ def train_test(
     print('The best ACC/MCC: %.5f / %.5f' % (acc, mcc))
 
     '''保存最终输出模型以及测试结果数据'''
-    with open(os.path.join(output_dir,f'results.txt'),'a+') as f:
+    with open(os.path.join(output_dir, 'results.txt'), 'a+') as f:
         # 只在第一折时保存超参数设置
         if fold == 1:
             f.write("\n===== Hyperparameters =====\n")
@@ -730,24 +507,10 @@ def train_test(
         pickle.dump(test_data, f)
     print("Test data saved to: %s" % os.path.join(output_dir, f'testdata_fold{str(fold)}.pkl'))
 
-    # plt.switch_backend('Agg')
-    # fig = plt.figure()
-    # pic1 = fig.add_subplot(2,1,1)
-    # pic2 = fig.add_subplot(2,1,2)
-    # pic1.plot(train_epoches,"skyblue",label="train_loss")
-    # pic2.plot(test_epoches,"pink",label="test_loss")
-    # pic1.legend()
-    # pic2.legend()
-    # pic1.set_ylabel("loss")
-    # pic2.set_xlabel("epoch")
-    # pic2.set_ylabel("loss")
-    # plt.savefig(os.path.join(args.rawpath,"loss_curve.jpg"))
-
     return i_auc, iPR_auc, rmse, mae, acc, mcc
 
 def train(model, train_loader, optimizer, lossfunction2, device,
-          global_drug_features, global_side_features, global_drug_token_features=None,
-          global_side_token_features=None, args=None):
+          global_drug_features, global_side_features, global_mesh_token_feature, args):
     """训练函数 - 带进度条和实时指标"""
     model.train()
     
@@ -758,13 +521,10 @@ def train(model, train_loader, optimizer, lossfunction2, device,
     pbar = tqdm(enumerate(train_loader, 0), total=len(train_loader), desc="Training")
     for step, batch in pbar:
         drug_idx, side_idx, soft_labels, ratings, sample_weights = batch[:5]
-        risk_components = batch[5] if len(batch) > 5 else None
         # E3 训练样本为五列：soft_label 负责分类，rating 只给真实正样本回归，sample_weight 表示负标签可信度。
         soft_labels = soft_labels.to(device, non_blocking=True)
         ratings = ratings.to(device, non_blocking=True)
         sample_weights = sample_weights.to(device, non_blocking=True)
-        if risk_components is not None:
-            risk_components = risk_components.to(device, non_blocking=True)
         real_positive_mask = ratings > 0
         
         optimizer.zero_grad()
@@ -776,8 +536,7 @@ def train(model, train_loader, optimizer, lossfunction2, device,
             device=device,
             global_drug_features=global_drug_features,
             global_side_features=global_side_features,
-            global_drug_token_features=global_drug_token_features,
-            global_side_token_features=global_side_token_features,
+            global_mesh_token_feature=global_mesh_token_feature,
         )
         # 模型内部使用 squeeze；这里拉平成一维，避免 batch_size=1 时退化成标量。
         logits, reconstruction = model_output
@@ -791,20 +550,9 @@ def train(model, train_loader, optimizer, lossfunction2, device,
         else:
             y_target = soft_labels
 
-        # 分类分支使用固定权重或可学习的多源风险融合。
+        # 分类分支直接使用固定 RPU 样本权重。
         raw_bce = nn.functional.binary_cross_entropy_with_logits(logits, y_target, reduction='none')
-        negative_mask = (soft_labels <= 0) & (ratings <= 0)
-        dynamic_weights = sample_weights
-        fusion_regularization = logits.new_zeros(())
-        if args.rpu_weight_mode == "learnable":
-            fusion_weights = torch.softmax(model.rpu_fusion_logits, dim=0)
-            fused_risk = (risk_components * fusion_weights).sum(dim=1)
-            learned_weights = torch.clamp(1.0 - fused_risk, min=MIN_NEG_WEIGHT, max=1.0)
-            dynamic_weights = torch.where(negative_mask, learned_weights, sample_weights)
-            # 弱正则避免训练初期系数直接集中到单一特征，同时保留自适应空间。
-            uniform = torch.full_like(fusion_weights, 1.0 / len(fusion_weights))
-            fusion_regularization = FUSION_REGULARIZATION * torch.mean((fusion_weights - uniform) ** 2)
-        loss1 = (raw_bce * dynamic_weights).mean() + fusion_regularization
+        loss1 = (raw_bce * sample_weights).mean()
 
         # 回归分支只训练真实正样本，避免未观察负样本的 0 rating 污染强度预测。
         if real_positive_mask.any():
@@ -814,7 +562,7 @@ def train(model, train_loader, optimizer, lossfunction2, device,
         total_loss = args.lambda_cls * loss1 + args.lambda_reg * loss2
         
         total_loss.backward()
-        if args.grad_clip is not None and args.grad_clip > 0:
+        if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
         optimizer.step()
         
@@ -830,11 +578,11 @@ def train(model, train_loader, optimizer, lossfunction2, device,
     return avg_loss, step + 1
 
 def test(model, test_loader, device, global_drug_features, global_side_features,
-         global_drug_token_features=None, global_side_token_features=None,
-         lossfunction1=None, lossfunction2=None, args=None):
+         global_mesh_token_feature,
+         lossfunction1, lossfunction2, args):
     """测试函数 - 带进度条和实时指标"""
     model.eval()
-    logit_adjustment_bias = compute_logit_adjustment_bias(args)
+    logit_adjustment_bias = compute_logit_adjustment_bias(args.use_rpu)
     
     pred1 = []
     pred2 = []
@@ -864,8 +612,7 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
             device=device,
             global_drug_features=global_drug_features,
             global_side_features=global_side_features,
-            global_drug_token_features=global_drug_token_features,
-            global_side_token_features=global_side_token_features,
+            global_mesh_token_feature=global_mesh_token_feature,
         )
         # 测试集最后一个 batch 可能只有1条样本，统一成一维张量后再计算指标。
         scores_one = scores_one.view(-1)
@@ -880,9 +627,7 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
             loss2 = lossfunction2(scores_two[positive_mask], ratings[positive_mask])#在正样本上计算MSELoss
         else:
             loss2 = scores_two.new_zeros(())
-        lambda_cls = args.lambda_cls if args is not None else 0.7
-        lambda_reg = args.lambda_reg if args is not None else 0.2
-        test_loss = lambda_cls * loss1 + lambda_reg * loss2
+        test_loss = args.lambda_cls * loss1 + args.lambda_reg * loss2
         test_avg_loss += test_loss.detach().item()
         
         # 收集预测结果。RPU使用大量未观察负样本时，logit先验校正只修正概率尺度，不改变排序关系。
@@ -909,10 +654,7 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
                                                                       sample_weight=None)
     iPR_auc = metrics.auc(irecall, iprecision)
 
-    try:
-        i_auc = metrics.roc_auc_score(label_truth, pred1)
-    except ValueError:
-        i_auc = 0
+    i_auc = metrics.roc_auc_score(label_truth, pred1)
 
     one_label_index = np.nonzero(label_truth)
     rmse = sqrt(mean_squared_error(pred2[one_label_index], ground_truth[one_label_index]))
@@ -963,16 +705,10 @@ if __name__ == '__main__':
                         metavar='FLOAT', help='验证综合分数至少提升多少才算真正变好')
     parser.add_argument('--min_lr', type=float, default=1e-5,
                         metavar='FLOAT', help='学习率调度器允许降到的最小学习率')
-    parser.add_argument('--drug_features', type=str, default='DGen,CS,DSA',
-                        help='药物相似度特征，允许 DGen、CS、DSA')
-    parser.add_argument('--adr_features', type=str, default='MESH,GDA,DSA',
-                        help='ADR相似度特征，允许 MESH、GDA、DSA')
-    parser.add_argument('--raw_feature_mode', choices=['none', 'replace'], default='none',
-                        help='原始特征使用方式：replace为预测模型仅使用原始特征')
-    parser.add_argument('--raw_drug_features', type=str, default='DGen,CS',
-                        help='药物原始特征，允许 DGen、CS')
-    parser.add_argument('--raw_adr_features', type=str, default='MESH,GDA',
-                        help='ADR原始特征，允许 MESH、GDA')
+    parser.add_argument('--feature_mode', choices=['similarity', 'tfidf_svd'],
+                        default='tfidf_svd', help='特征模式：原基座 similarity 或 TF-IDF-SVD')
+    parser.add_argument('--use_rpu', action=argparse.BooleanOptionalAction, default=True,
+                        help='统一控制 RPU 加权负采样与 logit adjustment')
     parser.add_argument('--val_source', choices=['train', 'test'], default='train',
                         help='验证集来源：train为严格口径，test仅用于复现旧口径')
     parser.add_argument('--val_ratio', type=float, default=0.2,
@@ -981,81 +717,50 @@ if __name__ == '__main__':
                         metavar='FLOAT', help='分类损失权重')
     parser.add_argument('--lambda_reg', type=float, default=0.2,
                         metavar='FLOAT', help='回归损失权重')
-    parser.add_argument('--use_logit_adjustment',default=True, action='store_true',
-                        help='启用RPU类别先验logit校正，修正负采样导致的概率整体偏低')
-    parser.add_argument('--use_rpu',default=True, action='store_true',
-                        help='启用RPU-DGAPred E3训练样本构造')
-    parser.add_argument('--rpu_weight_mode', choices=['none', 'learnable'], default='none',
-                        help='RPU负样本权重模式：none固定，ema预测风险滑动更新，learnable学习特征融合系数')
-    parser.add_argument('--rpu_use_consensus_pseudo',default=True, action='store_true',
-                        help='启用多视图共识伪阳性：多个特征视图一致高分的未知pair会以弱标签加入训练')
     args = parser.parse_args()
-    drug_tokens = parse_feature_tokens(args.drug_features)
-    adr_tokens = parse_feature_tokens(args.adr_features)
-    raw_drug_tokens = parse_feature_tokens(args.raw_drug_features)
-    raw_adr_tokens = parse_feature_tokens(args.raw_adr_features)
-    if not drug_tokens <= {"DGEN", "CS", "DSA"}:
-        raise ValueError("drug_features 只允许 DGen、CS、DSA。")
-    if not adr_tokens <= {"MESH", "GDA", "DSA"}:
-        raise ValueError("adr_features 只允许 MESH、GDA、DSA。")
-    if not raw_drug_tokens <= {"DGEN", "CS"}:
-        raise ValueError("raw_drug_features 只允许 DGen、CS。")
-    if not raw_adr_tokens <= {"MESH", "GDA"}:
-        raise ValueError("raw_adr_features 只允许 MESH、GDA。")
-    if args.rpu_weight_mode != "none" and not args.use_rpu:
-        raise ValueError("learnable 权重模式只能在启用 RPU 时使用。")
-    normalize_raw_configuration(args)
-    print(
-        f"[RawFeatureConfig] mode={args.raw_feature_mode}, "
-        f"drug={args.raw_drug_features or 'none'}, adr={args.raw_adr_features or 'none'}"
-    )
-    print(f"[RPU-Weight] mode={args.rpu_weight_mode}")
+    print(f"[FeatureMode] {args.feature_mode}")
+    print(f"[TrainingStrategy] rpu_logit_adjustment={args.use_rpu}")
     configure_cpu_threads(
         args.torch_threads,
         args.torch_interop_threads,
         prefer_cuda=torch.cuda.is_available()
     )
-    if args.use_logit_adjustment:
-        print(f"[LogitAdjustment] bias={compute_logit_adjustment_bias(args):.4f}")
-    args.rawpath, args.similarity_path = ensure_training_feature_cache(
+    print(f"[LogitAdjustment] bias={compute_logit_adjustment_bias(args.use_rpu):.4f}")
+    args.rawpath, args.similarity_path = ensure_training_feature_cache(#生成相似度特征
         args.rawpath,
         args.similarity_path
     )
     
     drug_ids, adr_ids, drug_side = load_label(args)
-    print("drug_side shape:",pd.DataFrame(drug_side).shape)
+    print(f"[Dataset] drug_side shape={drug_side.shape}")
 
-    # 加载药物和不良反应特征；读取时再次校验顺序，防止特征矩阵与标签矩阵错位。
-    drug_feature, drug_feature_names = load_drug_feature(drug_ids, args)
-    side_feature, side_feature_names = load_adr_feature(adr_ids, args)
-    raw_drug_dense_features = {}
-    raw_drug_token_features = {}
-    raw_side_dense_features = {}
-    raw_side_token_features = {}
-    if args.raw_feature_mode != 'none':
-        raw_drug_dense_features, raw_drug_token_features = load_raw_drug_features(drug_ids, args)
-        raw_side_dense_features, raw_side_token_features = load_raw_adr_features(adr_ids, args)
-        if not (raw_drug_dense_features or raw_drug_token_features or raw_side_dense_features or raw_side_token_features):
-            raise ValueError('启用原始特征模式时，至少需要指定一个原始特征。')
-        print(
-            f"[RawFeature] mode={args.raw_feature_mode}, "
-            f"drug_dense={list(raw_drug_dense_features)}, drug_token={list(raw_drug_token_features)}, "
-            f"adr_dense={list(raw_side_dense_features)}, adr_token={list(raw_side_token_features)}"
+    (
+        similarity_drug_features,
+        similarity_side_features,
+        similarity_drug_feature_names,
+        similarity_side_feature_names,
+    ) = load_similarity_features(drug_ids, adr_ids, args)
+
+    tfidf_drug_dense_features = {}
+    tfidf_side_dense_features = {}
+    mesh_token_feature = None
+    if args.feature_mode == "tfidf_svd":
+        gene_svd = ensure_gene_tfidf_svd(
+            args.rawpath, args.similarity_path, drug_ids, adr_ids
         )
+        (
+            tfidf_drug_dense_features,
+            tfidf_side_dense_features,
+            mesh_token_feature,
+        ) = load_tfidf_svd_features(drug_ids, adr_ids, args, gene_svd)
     
     # 外层交叉验证仍使用1:1正负样本，保证验证/测试口径和原DGAPred对照一致。
     final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values)
     final_sample = np.vstack((final_positive_sample, final_negative_sample))
-    X = final_sample[:, 0::]
-    final_target = final_sample[:, final_sample.shape[1] - 1]
-    y = final_target
-    data = []
-    data_x = []
-    data_y = []
-    for i in range(X.shape[0]):
-        data_x.append((X[i, 0], X[i, 1]))
-        data_y.append((int(float(X[i, 2]))))
-        data.append((X[i, 0], X[i, 1], X[i, 2]))
+    # 分层器只使用 pair 索引和标签；完整三列样本保留给每个 fold 继续切分。
+    data = final_sample
+    data_x = final_sample[:, :2]
+    data_y = final_sample[:, 2].astype(int)
     
     # 正常五折训练
     fold = 1
@@ -1068,9 +773,8 @@ if __name__ == '__main__':
     output_dir = os.path.join(normalized_rawpath, f'output_{timestamp}')
     os.makedirs(output_dir, exist_ok=True)
     #开始五折交叉验证
-    for k, (train_split, test_split) in enumerate(kfold.split(data_x, data_y)):
+    for train_split, test_split in kfold.split(data_x, data_y):
         print("==================================fold {} start".format(fold))
-        data = np.array(data)
         fold_train_data = data[train_split].tolist()
         test_data = data[test_split].tolist()
         if args.val_source == 'train':
@@ -1090,64 +794,67 @@ if __name__ == '__main__':
             f"train={len(fold_train_data)}, val={len(val_data)}, test={len(test_data)}",
             flush=True
         )
-        risk_drug_feature, risk_side_feature, risk_drug_feature_names, risk_side_feature_names = add_dsa_features(
-            drug_feature,
-            side_feature,
-            drug_feature_names,
-            side_feature_names,
-            drug_side,
-            val_data + test_data,
-            args
-        )
-        model_drug_feature = risk_drug_feature
-        model_side_feature = risk_side_feature
-        model_drug_token_features = None
-        model_side_token_features = None
-        token_feature_mode = "none"
-        if args.raw_feature_mode == 'replace':
-            model_drug_feature, model_drug_feature_names = raw_dense_feature_list(raw_drug_dense_features)
-            model_side_feature, model_side_feature_names = raw_dense_feature_list(raw_side_dense_features)
-            model_drug_feature, model_side_feature, model_drug_feature_names, model_side_feature_names = add_raw_dsa_features(
-                model_drug_feature,
-                model_side_feature,
-                model_drug_feature_names,
-                model_side_feature_names,
+        if args.use_rpu or args.feature_mode == "similarity":
+            (
+                rpu_fold_drug_features,
+                rpu_fold_side_features,
+                rpu_fold_drug_feature_names,
+                rpu_fold_side_feature_names,
+            ) = build_fold_similarity_features(
+                similarity_drug_features,
+                similarity_side_features,
+                similarity_drug_feature_names,
+                similarity_side_feature_names,
                 drug_side,
                 val_data + test_data,
-                args,
             )
-            model_drug_token_features = raw_drug_token_features
-            model_side_token_features = raw_side_token_features
-            token_feature_mode = "replace"
-            print(f"[RawFeature] Fold {fold} prediction uses raw-only views: "
-                  f"drug={model_drug_feature_names + list(raw_drug_token_features)}, "
-                  f"adr={model_side_feature_names + list(raw_side_token_features)}")
+
         if args.use_rpu:
-            fold_train_data = build_rpu_train_samples(
+            fold_train_data = build_rpu_train_samples(#真实正样本 + 加权负样本
                 fold_train_data,
                 val_data + test_data,
                 drug_side.values,
-                risk_drug_feature,
-                risk_side_feature,
-                args,
+                rpu_fold_drug_features,
+                rpu_fold_side_features,
                 fold,
-                risk_drug_feature_names,
-                risk_side_feature_names,
             )
         else:
             fold_train_data = to_weighted_train_samples(fold_train_data)
+
+        if args.feature_mode == "similarity":
+            prediction_drug_features = rpu_fold_drug_features
+            prediction_side_features = rpu_fold_side_features
+            prediction_drug_feature_names = rpu_fold_drug_feature_names
+            prediction_side_feature_names = rpu_fold_side_feature_names
+            prediction_mesh_token_feature = None
+        else:
+            (
+                prediction_drug_features,#drug gene svd features + DSA + CS
+                prediction_side_features,#side gene svd features + DSA
+                prediction_drug_feature_names,
+                prediction_side_feature_names,
+            ) = build_tfidf_svd_prediction_features(
+                tfidf_drug_dense_features,
+                tfidf_side_dense_features,
+                drug_side,
+                val_data + test_data,
+            )
+            prediction_mesh_token_feature = mesh_token_feature
+
+        print(
+            f"[Prediction] Fold {fold} drug={prediction_drug_feature_names}, "
+            f"adr={prediction_side_feature_names}"
+        )
         auc, PR_auc, rmse, mae, acc, mcc = train_test(
-            model_drug_feature,
-            model_side_feature,
+            prediction_drug_features,
+            prediction_side_features,
             fold_train_data,
             val_data,
             test_data,
             fold,
             args,
             output_dir,
-            raw_drug_token_features=model_drug_token_features,
-            raw_side_token_features=model_side_token_features,
-            token_feature_mode=token_feature_mode,
+            mesh_token_feature=prediction_mesh_token_feature,
         )
         total_rmse.append(rmse)
         total_mae.append(mae)
