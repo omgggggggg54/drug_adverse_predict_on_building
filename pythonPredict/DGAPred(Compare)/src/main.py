@@ -21,9 +21,8 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 
-from sklearn import metrics
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from tqdm import tqdm
 
 from model.model import DGAPred
@@ -37,15 +36,40 @@ from utils.raw_feature_generation import (
     read_ordered_mesh_token_feature,
 )
 from utils.rpu_utils import build_rpu_train_samples, to_weighted_train_samples
+from utils.topology_score import (
+    MULTISCALE_FEATURE_NAMES,
+    assert_hidden_pairs_are_masked,
+    build_topology_scorer,
+)
+from utils.topology_calibration import (
+    classification_metrics,
+    fit_topology_calibration,
+    predict_topology_calibration,
+)
 
 # 设置随机种子确保可复现性
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+# 外层五折沿用历史 random_state=5；其余随机入口统一使用 SEED。
+OUTER_FOLD_SEED = 5
+OUTER_FOLD_COUNT = 5
+
+
+def set_random_seed(seed):
+    """统一设置 Python、NumPy 和 PyTorch 的随机状态。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+set_random_seed(SEED)
+# 固定 cuDNN/CUDA 算法，保证相同 seed 的重复运行不会因算子选择产生额外波动。
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+torch.use_deterministic_algorithms(True)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 def configure_cpu_threads(torch_threads, torch_interop_threads, prefer_cuda=False):
@@ -125,24 +149,67 @@ def load_similarity_features(drug_ids, adr_ids, args):
     return drug_features, side_features, drug_feature_names, side_feature_names
 
 
-def split_val_test(data_test, val_ratio=0.2, seed=42):
-    """旧评估口径：从当前测试折里切出验证集和最终测试集。"""
-    data_test = np.array(data_test)
-    labels = data_test[:, 2].astype(int)
+def split_train_val(data_train, val_ratio=0.2):
+    """未启用拓扑校准时，从外层训练折中固定切出早停验证集。"""
+    # 此路径不需要独立校准集：验证集只负责 CNN 早停，最终测试集仍完全隔离。
+    # 输入每行是 [drug_idx, adr_idx, rating]；返回的两组样本保持同一列格式。
+    samples = np.asarray(data_train)
+    labels = (samples[:, 2] > 0).astype(np.int32)
     n_splits = max(2, int(round(1.0 / val_ratio)))
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    val_idx, test_idx = next(splitter.split(np.zeros(len(labels)), labels))
-    return data_test[val_idx].tolist(), data_test[test_idx].tolist()
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+    train_idx, val_idx = next(splitter.split(samples[:, :2], labels))
+    return samples[train_idx].tolist(), samples[val_idx].tolist()
 
 
-def split_train_val(data_train, val_ratio=0.2, seed=42):
-    """严格评估口径：从训练折里切验证集，外层测试折保持完全独立。"""
-    data_train = np.array(data_train)
-    labels = data_train[:, 2].astype(int)
-    n_splits = max(2, int(round(1.0 / val_ratio)))
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    train_idx, val_idx = next(splitter.split(np.zeros(len(labels)), labels))
-    return data_train[train_idx].tolist(), data_train[val_idx].tolist()
+def split_train_val_calibration(data_train, val_ratio=0.1, calibration_ratio=0.1):
+    """按正负标签固定切分基础训练、验证与校准集。"""
+    # 只保留最必要的标签分层，不再引入药物度数、ADR 度数和稀有组合合并。
+    # 第一阶段从外层训练折取出校准集，第二阶段再从剩余样本取出验证集。
+    if val_ratio <= 0 or calibration_ratio <= 0 or val_ratio + calibration_ratio >= 1:
+        raise ValueError("早停验证和校准比例必须大于 0，且总和小于 1。")
+
+    samples = np.asarray(data_train)
+    # 每行格式为 [drug_idx, adr_idx, rating]；分层只使用 rating 是否大于零。
+    labels = (samples[:, 2] > 0).astype(np.int32)
+    calibration_splitter = StratifiedShuffleSplit(
+        n_splits=1,
+        test_size=calibration_ratio,
+        random_state=SEED,
+    )
+    remaining_idx, calibration_idx = next(
+        calibration_splitter.split(samples[:, :2], labels)
+    )
+    remaining = samples[remaining_idx]
+    remaining_labels = labels[remaining_idx]
+
+    # 校准集已经取走 calibration_ratio，因此验证比例需换算到剩余样本中。
+    # 默认值下为 0.1 / 0.9，最终得到约 80%/10%/10%。
+    validation_ratio_in_remaining = val_ratio / (1.0 - calibration_ratio)
+    validation_splitter = StratifiedShuffleSplit(
+        n_splits=1,
+        test_size=validation_ratio_in_remaining,
+        random_state=SEED,
+    )
+    base_idx, validation_idx = next(
+        validation_splitter.split(remaining[:, :2], remaining_labels)
+    )
+    return (
+        remaining[base_idx].tolist(),        # 基础训练集：训练 CNN 并构造拓扑矩阵 A。
+        remaining[validation_idx].tolist(),  # 验证集：只用于 CNN 早停。
+        samples[calibration_idx].tolist(),   # 校准集：只用于拟合线性排序校准器。
+    )
+
+
+def assert_disjoint_pair_splits(*datasets):
+    """校验一个外层折内的基础训练、验证、校准和测试 pair 互不重叠。"""
+    pair_sets = []
+    for data in datasets:
+        samples = np.asarray(data)
+        pair_sets.append({(int(row[0]), int(row[1])) for row in samples})
+    for index, current in enumerate(pair_sets):
+        for other in pair_sets[index + 1:]:
+            if current & other:
+                raise RuntimeError("训练、验证、校准和测试 pair 存在重叠，终止以避免泄露。")
 
 
 def load_tfidf_svd_features(drug_ids, adr_ids, args, gene_svd):
@@ -241,8 +308,8 @@ def Extract_positive_negative_samples(DAL):
     final_positive_sample = data_shuffle[number_negative:]
     negative_sample = data_shuffle[:number_negative]
     
-    # 保持与旧实现一致：先生成完整随机排列，再取前面的等量负样本。
-    sampled_indices = random.sample(range(number_negative), number_negative)
+    # 固定局部随机生成器，避免其他模块消耗随机状态后改变外层测试样本。
+    sampled_indices = random.Random(SEED).sample(range(number_negative), number_negative)
     final_negative_sample = negative_sample[sampled_indices[:number_positive]]
     return final_positive_sample, final_negative_sample
 
@@ -258,21 +325,30 @@ def compute_logit_adjustment_bias(use_rpu):
 
 def train_test(
         drug_feature, side_feature, data_train, data_val, data_test, fold, args, output_dir,
-        mesh_token_feature):
-    """一折的训练和评估函数。
-    
+        mesh_token_feature, calibration_data=None, topology_scorer=None):
+    """完成一个外层折的 CNN 训练、线性校准和最终评估。
+
+    当启用拓扑校准时，外层训练折已经在主流程中划分为基础训练集、
+    早停验证集和独立校准集。CNN 只使用基础训练集训练，并由验证集
+    选择最佳权重；最佳 CNN 的原始分类 logit 与 16 维多尺度拓扑特征随后在
+    校准集上拟合标准化线性 RankNet。校准器固定
+    后，外层测试集只进行一次最终预测，测试标签不参与任何训练或选择。
+
     Args:
-        drug_feature: 药物相似性矩阵列表
-        side_feature: 副作用相似性矩阵列表
-        data_train: 训练样本
-        data_val: 验证样本
-        data_test: 最终测试样本
-        fold: 当前折数
-        args: 命令行参数
-        output_dir: 当前训练输出目录
-        
+        drug_feature: 当前折使用的药物特征矩阵列表。
+        side_feature: 当前折使用的副作用特征矩阵列表。
+        data_train: CNN 基础训练样本；不包含验证、校准和外层测试 pair。
+        data_val: CNN 早停验证样本；只用于选择最佳 CNN 权重。
+        data_test: 外层最终测试样本；只在全部模型固定后进行一次评估。
+        fold: 当前外层折编号。
+        args: 命令行参数和训练配置。
+        output_dir: 当前运行的结果输出目录。
+        mesh_token_feature: ADR MESH token 特征；未使用时为 None。
+        calibration_data: 独立校准样本；未启用拓扑校准时为空或 None。
+        topology_scorer: 仅由基础训练正边构造的拓扑特征生成器。
+
     Returns:
-        Evaluation metrics (AUC, AUPR, RMSE, MAE, ACC, MCC)
+        当前外层折的 AUC、AUPR、RMSE、MAE、ACC 和 MCC。
     """
     print(f"\n{'='*60}")
     print(f"Fold {fold} Training")
@@ -334,14 +410,13 @@ def train_test(
     )
     
     '''配置cuda加速'''
-    torch.backends.cudnn.benchmark = True
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
 
     # 全局特征矩阵很小，直接每个 fold 只搬一次到 GPU，避免每个 batch 重复整表拷贝。
     global_drug_features_tensor = global_drug_features_tensor.to(device, non_blocking=use_cuda)
@@ -440,7 +515,7 @@ def train_test(
             global_mesh_token_feature,
             args=args,
         )  # 一个iterater
-        v_i_auc, v_iPR_auc, v_rmse, v_mae, v_acc, v_mcc, v_ground_i, v_ground_u, v_ground_truth, v_pred1, v_pred2, val_iter_loss, val_step = test(model,
+        v_i_auc, v_iPR_auc, v_rmse, v_mae, v_acc, v_mcc, _, _, _, _ = test(model,
                                                                                                            _val,
                                                                                                            device,
                                                                                                            global_drug_features_tensor,
@@ -448,7 +523,8 @@ def train_test(
                                                                                                            global_mesh_token_feature,
                                                                                                            lossfunction1=Classification_criterion,
                                                                                                            lossfunction2=Regression_criterion,
-                                                                                                           args=args)
+                                                                                                           args=args,
+                                                                                                           progress_name="Validation")
                                                                                          
         # AUC和AUPR都反映分类排序效果，用同一个综合分数保存最佳模型，避免只提升一个指标就覆盖模型。
         val_score = 0.5 * (v_i_auc + v_iPR_auc)
@@ -476,15 +552,62 @@ def train_test(
     
     model.load_state_dict(best_model_state)
     print(f"\n[Info] Loaded best model from validation (AUC: {AUC_mn:.5f}, AUPR: {AUPR_mn:.5f})")
+    topology_calibration = None
+    topology_feature_names = []
+    if args.use_topology_fusion:
+        print("[TopologyFusion] 开始构建校准特征并拟合线性校准器")
+
+        # 1. 特征构建：固定 CNN 后，独立校准集的 CNN logit 与折内拓扑特征拼成 17 维输入。
+        # DataLoader 关闭 shuffle，使 pair、标签、logit 和拓扑特征始终按相同顺序拼接。
+        # 校准集没有参与 CNN 反向传播，也没有参与最佳 epoch 的选择。
+        calibration_array = np.asarray(calibration_data)
+        calibration_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(
+                torch.LongTensor(calibration_array[:, 0].astype(int)),
+                torch.LongTensor(calibration_array[:, 1].astype(int)),
+                torch.FloatTensor(calibration_array[:, 2]),
+            ),
+            batch_size=args.test_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=use_cuda,
+        )
+        calibration_pairs, calibration_labels, calibration_logits = collect_raw_predictions(
+            model, calibration_loader, device, global_drug_features_tensor,
+            global_side_features_tensor, global_mesh_token_feature, "Calibration logits"
+        )
+        # 第一列保留未经过 RPU 先验偏置修正的 CNN 原始 logit；其余 16 列来自基础训练正边。
+        # 因而 calibration_features 形状为 (校准样本数, 17)，每一行只对应一个校准 pair。
+        calibration_features = np.column_stack((
+            calibration_logits,
+            topology_scorer.pair_features(calibration_pairs[:, 0], calibration_pairs[:, 1]),
+        ))
+
+        # 2. 模型拟合：只在独立校准集上拟合标准化线性 BCE + RankNet 校准器。
+        topology_calibration = fit_topology_calibration(calibration_features, calibration_labels)#拟合线性校准器
+        # 该字典保存标准化均值、尺度、17 个线性权重和偏置；写入检查点后可独立重现实验推理。
+        topology_feature_names = ["cnn_logit"] + MULTISCALE_FEATURE_NAMES
+        print("[TopologyFusion] 标准化特征权重：")
+        for name, weight in zip(topology_feature_names, topology_calibration["weight"].tolist()):
+            print(f"  {name}: {weight:.6f}")
+
+    # 校准器固定后，外层测试集只在这里进行一次最终推理。
+    # 测试集既不参与 CNN 早停，也不参与 scaler、线性权重、RankNet 配对或阈值选择。
     final_start = time.time()
-    i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step_ = test(
+    i_auc, iPR_auc, rmse, mae, acc, mcc, ground_truth, pred1, raw_pred1, pred2 = test(
         model, _test, device, global_drug_features_tensor, global_side_features_tensor,
         global_mesh_token_feature,
         lossfunction1=Classification_criterion,
         lossfunction2=Regression_criterion,
-        args=args
+        args=args,
+        topology_calibration=topology_calibration,
+        topology_scorer=topology_scorer,
+        progress_name="Outer test",
     )
     time_cost = time.time() - final_start
+    raw_labels = (ground_truth > 0).astype(np.float32)
+    raw_auc, raw_aupr, _, _ = classification_metrics(raw_labels, raw_pred1)
+    print(f"[CNN] 原始分类 AUC/AUPR: {raw_auc:.5f} / {raw_aupr:.5f}")
     print("Time: %.2f <Test> RMSE: %.5f, MAE: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f " % (
         time_cost, rmse, mae, i_auc, iPR_auc, acc, mcc))
     print('The best AUC/AUPR: %.5f / %.5f' % (i_auc, iPR_auc))
@@ -498,12 +621,28 @@ def train_test(
             for arg, value in vars(args).items():
                 f.write(f"{arg}: {value}\n")
             f.write("===========================\n\n")
-        f.write("Fold %d: AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f\n" % (fold, i_auc, iPR_auc, acc, mcc))
-    with open(os.path.join(output_dir, f'model_fold{str(fold)}.pkl'), 'wb') as f:
-        pickle.dump(model.state_dict(), f)
-    print("Model saved to: %s" % os.path.join(output_dir, f'model_fold{str(fold)}.pkl'))
+        f.write(
+            "Fold %d: CNN_AUC: %.5f, CNN_AUPR: %.5f, AUC: %.5f, AUPR: %.5f, ACC: %.5f, MCC: %.5f\n" %
+            (fold, raw_auc, raw_aupr, i_auc, iPR_auc, acc, mcc)
+        )
+    checkpoint_path = os.path.join(output_dir, f'model_fold{str(fold)}.pth')
+    checkpoint = {"model_state_dict": model.state_dict()}
+    if topology_calibration is not None:
+        # 保存完整校准器而非只保存预测值，便于后续加载同一 CNN 后对新 pair 做一致推理。
+        checkpoint.update({
+            "topology_calibration": topology_calibration,
+            "topology_feature_names": topology_feature_names,
+        })
+    torch.save(checkpoint, checkpoint_path)
+    print("Model saved to: %s" % checkpoint_path)
     with open(os.path.join(output_dir,f'testdata_fold{str(fold)}.pkl'),'wb') as f:
-        test_data={"ground_truth":ground_truth,"pred_value":pred1}
+        test_data={
+            "ground_truth": ground_truth,
+            # 保留校准前概率，供逐折比较 CNN 本身与拓扑校准带来的变化。
+            "cnn_pred_value": raw_pred1,
+            # pred_value 为启用校准后的概率；未启用拓扑校准时它与 cnn_pred_value 相同。
+            "pred_value": pred1,
+        }
         pickle.dump(test_data, f)
     print("Test data saved to: %s" % os.path.join(output_dir, f'testdata_fold{str(fold)}.pkl'))
 
@@ -577,23 +716,54 @@ def train(model, train_loader, optimizer, lossfunction2, device,
 
     return avg_loss, step + 1
 
+
+def collect_raw_predictions(model, data_loader, device, global_drug_features,
+                            global_side_features, global_mesh_token_feature, progress_name):
+    """收集未做 RPU 先验修正的分类 logit，供独立校准集拟合融合器。"""
+    # 这里返回的是 sigmoid 之前的 logit。线性校准器本身会重新学习偏置和特征权重，
+    # 因而不应在此叠加只服务于原 CNN 概率解释的 RPU logit_adjustment_bias。
+    model.eval()
+    pairs = []
+    labels = []
+    logits_all = []
+    with torch.inference_mode():
+        for drug_idx, side_idx, ratings in tqdm(data_loader, desc=progress_name, leave=False):
+            logits, _ = model(
+                drug_indices=drug_idx,
+                side_indices=side_idx,
+                device=device,
+                global_drug_features=global_drug_features,
+                global_side_features=global_side_features,
+                global_mesh_token_feature=global_mesh_token_feature,
+            )
+            pairs.append(np.column_stack((drug_idx.numpy(), side_idx.numpy())))
+            labels.append((ratings.numpy() > 0).astype(np.float32))
+            logits_all.append(logits.view(-1).detach().cpu().numpy())
+    return (
+        # 三个数组由同一批次循环顺序收集，行号一一对应。
+        np.concatenate(pairs).astype(np.int64),
+        np.concatenate(labels).astype(np.float32),
+        np.concatenate(logits_all).astype(np.float32),
+    )
+
+
 def test(model, test_loader, device, global_drug_features, global_side_features,
          global_mesh_token_feature,
-         lossfunction1, lossfunction2, args):
+         lossfunction1, lossfunction2, args, topology_calibration=None, topology_scorer=None,
+         progress_name="Testing"):
     """测试函数 - 带进度条和实时指标"""
     model.eval()
     logit_adjustment_bias = compute_logit_adjustment_bias(args.use_rpu)
     
     pred1 = []
+    raw_pred1 = []
     pred2 = []
     ground_truth = []
     label_truth = []
-    ground_u = []
-    ground_i = []
     test_avg_loss = 0.0
     
     # 创建进度条，使用no_grad避免构建计算图
-    pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc="Testing")
+    pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc=progress_name)
     with torch.inference_mode():
       for step, (drug_idx, side_idx, ratings) in pbar:
         # 构建二分类标签
@@ -601,9 +771,6 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
         labels_cpu = (ratings_cpu > 0).float()
         ratings = ratings_cpu.to(device, non_blocking=True)
         labels = labels_cpu.to(device, non_blocking=True)
-        
-        ground_i.append(drug_idx.tolist())
-        ground_u.append(side_idx.tolist())
         
         # 前向传播score_one:classfication score_two:regression
         scores_one, scores_two = model(
@@ -630,9 +797,21 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
         test_loss = args.lambda_cls * loss1 + args.lambda_reg * loss2
         test_avg_loss += test_loss.detach().item()
         
-        # 收集预测结果。RPU使用大量未观察负样本时，logit先验校正只修正概率尺度，不改变排序关系。
-        prob_one = torch.sigmoid(adjusted_scores_one)
-        pred1.append(list(prob_one.data.cpu().numpy()))
+        # 保留未校准 CNN 概率，便于每折直接比较校准前后的 AUC/AUPR。
+        raw_probability = torch.sigmoid(adjusted_scores_one).cpu().numpy()
+        # 未启用校准时保持原 CNN 概率；启用后由固定线性校准器替换分类概率。
+        if topology_calibration is None:
+            probability = raw_probability
+        else:
+            # 测试阶段只读取校准集已保存的参数；pair_features 也只读取基础训练折预计算的矩阵。
+            # 因此这一分支没有任何基于当前测试标签的拟合或统计操作。
+            features = np.column_stack((
+                scores_one.detach().cpu().numpy(),
+                topology_scorer.pair_features(drug_idx.numpy(), side_idx.numpy()),
+            ))
+            probability = predict_topology_calibration(topology_calibration, features)
+        pred1.append(list(probability))
+        raw_pred1.append(list(raw_probability))
         pred2.append(list(scores_two.data.cpu().numpy()))
         ground_truth.append(ratings_cpu.tolist())
         label_truth.append(labels_cpu.tolist())
@@ -641,30 +820,18 @@ def test(model, test_loader, device, global_drug_features, global_side_features,
         pbar.set_postfix({'loss': f'{test_avg_loss/(step+1):.4f}'})
 
     pred1 = np.array(sum(pred1, []), dtype = np.float32)
+    raw_pred1 = np.array(sum(raw_pred1, []), dtype=np.float32)
     pred2 = np.array(sum(pred2, []), dtype=np.float32)
 
     ground_truth = np.array(sum(ground_truth, []), dtype = np.float32)
     label_truth = np.array(sum(label_truth, []), dtype=np.float32)
 
-
-
-    iprecision, irecall, ithresholds = metrics.precision_recall_curve(label_truth,
-                                                                      pred1,
-                                                                      pos_label=1,
-                                                                      sample_weight=None)
-    iPR_auc = metrics.auc(irecall, iprecision)
-
-    i_auc = metrics.roc_auc_score(label_truth, pred1)
-
     one_label_index = np.nonzero(label_truth)
     rmse = sqrt(mean_squared_error(pred2[one_label_index], ground_truth[one_label_index]))
     mae = mean_absolute_error(pred2[one_label_index], ground_truth[one_label_index])
-    # 依据0.5阈值计算二分类ACC与MCC
-    y_pred_bin = (pred1 >= 0.5).astype(np.int32)
-    acc = metrics.accuracy_score(label_truth, y_pred_bin)
-    mcc = metrics.matthews_corrcoef(label_truth, y_pred_bin)
+    i_auc, iPR_auc, acc, mcc = classification_metrics(label_truth, pred1)
 
-    return i_auc, iPR_auc, rmse, mae, acc, mcc, ground_i, ground_u, ground_truth, pred1, pred2, test_avg_loss, step + 1
+    return i_auc, iPR_auc, rmse, mae, acc, mcc, ground_truth, pred1, raw_pred1, pred2
 
 
 if __name__ == '__main__':
@@ -709,17 +876,24 @@ if __name__ == '__main__':
                         default='tfidf_svd', help='特征模式：原基座 similarity 或 TF-IDF-SVD')
     parser.add_argument('--use_rpu', action=argparse.BooleanOptionalAction, default=True,
                         help='统一控制 RPU 加权负采样与 logit adjustment')
-    parser.add_argument('--val_source', choices=['train', 'test'], default='train',
-                        help='验证集来源：train为严格口径，test仅用于复现旧口径')
     parser.add_argument('--val_ratio', type=float, default=0.2,
-                        metavar='FLOAT', help='验证集划分比例')
+                        metavar='FLOAT', help='基础模型早停验证集比例')
+    parser.add_argument('--use_topology_fusion', action=argparse.BooleanOptionalAction, default=True,
+                        help='启用无泄露的线性拓扑校准')
+    parser.add_argument('--topology_val_ratio', type=float, default=0.1,
+                        metavar='FLOAT', help='拓扑校准模式下早停验证集占外层训练折的比例')
+    parser.add_argument('--topology_calibration_ratio', type=float, default=0.1,
+                        metavar='FLOAT', help='拓扑校准集占外层训练折的比例')
     parser.add_argument('--lambda_cls', type=float, default=0.7,
                         metavar='FLOAT', help='分类损失权重')
     parser.add_argument('--lambda_reg', type=float, default=0.2,
                         metavar='FLOAT', help='回归损失权重')
     args = parser.parse_args()
+    set_random_seed(SEED)
     print(f"[FeatureMode] {args.feature_mode}")
     print(f"[TrainingStrategy] rpu_logit_adjustment={args.use_rpu}")
+    print(f"[TopologyFusion] enabled={args.use_topology_fusion}")
+    print(f"[Seed] global_rpu_split={SEED}, outer_fold={OUTER_FOLD_SEED}")
     configure_cpu_threads(
         args.torch_threads,
         args.torch_interop_threads,
@@ -754,46 +928,72 @@ if __name__ == '__main__':
             mesh_token_feature,
         ) = load_tfidf_svd_features(drug_ids, adr_ids, args, gene_svd)
     
-    # 外层交叉验证仍使用1:1正负样本，保证验证/测试口径和原DGAPred对照一致。
+    # 固定随机状态即可复现外层负样本与五折索引，不额外生成协议文件。
     final_positive_sample, final_negative_sample = Extract_positive_negative_samples(drug_side.values)
-    final_sample = np.vstack((final_positive_sample, final_negative_sample))
-    # 分层器只使用 pair 索引和标签；完整三列样本保留给每个 fold 继续切分。
-    data = final_sample
-    data_x = final_sample[:, :2]
-    data_y = final_sample[:, 2].astype(int)
+    data = np.vstack((final_positive_sample, final_negative_sample)).astype(np.float32)
+    data_x = data[:, :2]
+    # 五折分类分层只区分正负样本，原始 rating 仍完整保留在 data 中。
+    data_y = (data[:, 2] > 0).astype(np.int32)
     
     # 正常五折训练
     fold = 1
-    kfold = StratifiedKFold(5, random_state=5, shuffle=True)
     total_auc, total_pr_auc, total_rmse, total_mae = [], [], [], []
     total_acc, total_mcc = [], []
     #建立输出文件夹
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    normalized_rawpath = os.path.normpath(args.rawpath)#规范化路径，解决路径中的冗余和不一致
+    normalized_rawpath = os.path.normpath(args.rawpath)
     output_dir = os.path.join(normalized_rawpath, f'output_{timestamp}')
     os.makedirs(output_dir, exist_ok=True)
     #开始五折交叉验证
+    kfold = StratifiedKFold(OUTER_FOLD_COUNT, random_state=OUTER_FOLD_SEED, shuffle=True)
     for train_split, test_split in kfold.split(data_x, data_y):
+        # 每折从同一随机初始状态开始，RPU、DataLoader 与 CNN 初始化均可复现。
+        set_random_seed(SEED)
         print("==================================fold {} start".format(fold))
         fold_train_data = data[train_split].tolist()
         test_data = data[test_split].tolist()
-        if args.val_source == 'train':
+        calibration_data = []
+        if args.use_topology_fusion:
+            # 外层 train 折再拆成三个互斥部分：基础训练用于拟合 CNN，验证用于早停，
+            # 校准用于学习最终线性排序器。外层 test 折直到最后评估前都完全不可见。
+            fold_train_data, val_data, calibration_data = split_train_val_calibration(
+                fold_train_data,
+                val_ratio=args.topology_val_ratio,
+                calibration_ratio=args.topology_calibration_ratio,
+            )
+            # 在构建任意特征前校验 pair 互斥；一旦重叠立即终止，避免静默泄露。
+            assert_disjoint_pair_splits(
+                fold_train_data,
+                val_data,
+                calibration_data,
+                test_data,
+            )
+        else:
             fold_train_data, val_data = split_train_val(
                 fold_train_data,
                 val_ratio=args.val_ratio,
-                seed=42
-            )
-        else:
-            val_data, test_data = split_val_test(
-                test_data,
-                val_ratio=args.val_ratio,
-                seed=42
             )
         print(
-            f"[Fold {fold}] val_source={args.val_source}, "
-            f"train={len(fold_train_data)}, val={len(val_data)}, test={len(test_data)}",
+            f"[Fold {fold}] train={len(fold_train_data)}, val={len(val_data)}, "
+            f"calibration={len(calibration_data)}, test={len(test_data)}",
             flush=True
         )
+        # 所有非基础训练 pair 都进入隐藏集合，后续 DSA、DSARaw、RPU 和拓扑传播统一屏蔽。
+        # 这不仅屏蔽正边，也屏蔽验证/校准/测试中的负 pair，保证各阶段候选空间互不干扰。
+        hidden_data = val_data + calibration_data + test_data
+        topology_scorer = None
+        if args.use_topology_fusion:
+            # 拓扑 A 只接收 fold_train_data 的正边。药物 40 邻居、ADR 80 邻居分别固定，
+            # 因为两侧实体数量和相似度稠密度不同，不能用同一个 top-k 强行约束。
+            topology_scorer = build_topology_scorer(
+                similarity_drug_features,
+                similarity_side_features,
+                fold_train_data,
+                drug_side.shape,
+                drug_topk=40,
+                adr_topk=80,
+            )
+            assert_hidden_pairs_are_masked(topology_scorer.visible_matrix, hidden_data)
         if args.use_rpu or args.feature_mode == "similarity":
             (
                 rpu_fold_drug_features,
@@ -806,17 +1006,19 @@ if __name__ == '__main__':
                 similarity_drug_feature_names,
                 similarity_side_feature_names,
                 drug_side,
-                val_data + test_data,
+                hidden_data,
             )
 
         if args.use_rpu:
-            fold_train_data = build_rpu_train_samples(#真实正样本 + 加权负样本
+            # RPU 只从当前基础训练折可用的未观察 pair 中固定采样负样本。
+            # 返回五列训练格式：实体索引、软标签、真实 rating 与负样本风险权重。
+            fold_train_data = build_rpu_train_samples(
                 fold_train_data,
-                val_data + test_data,
+                hidden_data,
                 drug_side.values,
                 rpu_fold_drug_features,
                 rpu_fold_side_features,
-                fold,
+                seed=SEED,
             )
         else:
             fold_train_data = to_weighted_train_samples(fold_train_data)
@@ -829,15 +1031,16 @@ if __name__ == '__main__':
             prediction_mesh_token_feature = None
         else:
             (
-                prediction_drug_features,#drug gene svd features + DSA + CS
-                prediction_side_features,#side gene svd features + DSA
+                # TF-IDF/SVD 的实体属性特征与按 hidden_data 清零后的 DSARaw 一起使用。
+                prediction_drug_features,
+                prediction_side_features,
                 prediction_drug_feature_names,
                 prediction_side_feature_names,
             ) = build_tfidf_svd_prediction_features(
                 tfidf_drug_dense_features,
                 tfidf_side_dense_features,
                 drug_side,
-                val_data + test_data,
+                hidden_data,
             )
             prediction_mesh_token_feature = mesh_token_feature
 
@@ -855,6 +1058,8 @@ if __name__ == '__main__':
             args,
             output_dir,
             mesh_token_feature=prediction_mesh_token_feature,
+            calibration_data=calibration_data,
+            topology_scorer=topology_scorer,
         )
         total_rmse.append(rmse)
         total_mae.append(mae)
@@ -877,3 +1082,17 @@ if __name__ == '__main__':
         print('Total_MCC:')
         print(np.mean(total_mcc))
         sys.stdout.flush()
+
+    # 将最终五折均值写入结果文件，使文件内容与终端最后一组 Total_* 保持一致。
+    summary = {
+        "AUC": np.mean(total_auc),
+        "AUPR": np.mean(total_pr_auc),
+        "RMSE": np.mean(total_rmse),
+        "MAE": np.mean(total_mae),
+        "ACC": np.mean(total_acc),
+        "MCC": np.mean(total_mcc),
+    }
+    with open(os.path.join(output_dir, 'results.txt'), 'a+') as f:
+        f.write("\n===== Summary =====\n")
+        for name, value in summary.items():
+            f.write(f"{name}: {value:.10f}\n")

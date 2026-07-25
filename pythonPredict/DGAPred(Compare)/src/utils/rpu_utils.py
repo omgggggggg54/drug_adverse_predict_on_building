@@ -94,7 +94,7 @@ def build_rpu_train_samples(
         DAL,#(n_drugs, n_sides)
         drug_features,
         side_features,
-        fold):
+        seed=RANDOM_SEED):
     """按固定 RPU 负采样和 risk 权重为当前 fold 构造训练样本。
 
     输出列固定为：
@@ -107,7 +107,9 @@ def build_rpu_train_samples(
     candidate_mask = (np.asarray(DAL) <= 0) & (~_hidden_pair_mask(DAL.shape, hidden_data))#hidden_data->验证集和测试集 pair
     candidate_negative = np.argwhere(candidate_mask)#排除掉验证集和测试集 pair 后的所有未知 pair
 
-    rng = np.random.default_rng(RANDOM_SEED + fold)#随机数生成器
+    # 使用局部随机生成器，不污染全局 NumPy 状态；调用方始终传入统一 SEED=42。
+    # 不把 fold 编号混入 seed，确保同一基础训练数据在不同运行中采样完全一致。
+    rng = np.random.default_rng(seed)
 
     negative_count = min(int(len(positive_samples) * NEGATIVE_RATIO), len(candidate_negative))
     sampled_idx = rng.choice(len(candidate_negative), size=negative_count, replace=False)#从未知负样本中随机抽样
